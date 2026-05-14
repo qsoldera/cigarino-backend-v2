@@ -1,18 +1,9 @@
 const db = require('../config/database');
-const { cloudinary } = require('../config/cloudinary');
-const crypto = require('crypto');
-
-function computeHash(buffer) {
-  return crypto.createHash('sha256').update(buffer).digest('hex');
-}
 
 async function scan(req, res) {
   if (!req.file) return res.status(400).json({ error: 'Photo requise' });
-
   const imageUrl = req.file.path;
-
   try {
-    // Recherche par labels (hash-based, best-effort)
     const { rows: labels } = await db.query(`
       SELECT sl.cigar_id, sl.confidence,
         c.id, b.name as brand, c.name as model,
@@ -32,7 +23,6 @@ async function scan(req, res) {
       ORDER BY sl.confidence DESC
       LIMIT 5
     `);
-
     res.json({ image_url: imageUrl, results: labels });
   } catch (e) {
     console.error(e);
@@ -43,11 +33,12 @@ async function scan(req, res) {
 async function submitNewCigar(req, res) {
   const { brand_name, model_name, country_id, strength, avg_price,
     length_mm, ring_gauge, description, destination } = req.body;
-  const userId = req.user.id;
-
-  if (!brand_name || !model_name) return res.status(400).json({ error: 'Marque et modèle requis' });
-
+  const userId  = req.user.id;
+  const isAdmin = req.user.is_admin;
   const imageUrl = req.file?.path || null;
+
+  if (!brand_name || !model_name)
+    return res.status(400).json({ error: 'Marque et modèle requis' });
 
   const client = await db.connect();
   try {
@@ -55,35 +46,60 @@ async function submitNewCigar(req, res) {
 
     // Marque (upsert)
     let brandId;
-    const brandRes = await client.query('SELECT id FROM brands WHERE name ILIKE $1', [brand_name]);
+    const brandRes = await client.query(
+      'SELECT id FROM brands WHERE name ILIKE $1', [brand_name]);
     if (brandRes.rows.length) {
       brandId = brandRes.rows[0].id;
     } else {
-      const b = await client.query('INSERT INTO brands (name) VALUES ($1) RETURNING id', [brand_name]);
+      const b = await client.query(
+        'INSERT INTO brands (name) VALUES ($1) RETURNING id', [brand_name]);
       brandId = b.rows[0].id;
     }
 
-    // Cigare
-    const { rows } = await client.query(
-      `INSERT INTO cigars (brand_id, name, country_id, strength, avg_price, length_mm, ring_gauge, description, image_url, submitted_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       RETURNING id`,
-      [brandId, model_name, country_id || null, strength || null, avg_price || null,
-        length_mm || null, ring_gauge || null, description || null, imageUrl, userId]
-    );
+    // Si admin → colonnes admin_* + admin_verified = TRUE
+    let insertQuery, insertParams;
+    if (isAdmin) {
+      insertQuery = `
+        INSERT INTO cigars
+          (brand_id, name, admin_country_id, admin_strength, admin_avg_price,
+           admin_length_mm, admin_ring_gauge, admin_description,
+           admin_image_url, admin_verified, submitted_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10)
+        RETURNING id`;
+      insertParams = [
+        brandId, model_name,
+        country_id || null, strength || null, avg_price || null,
+        length_mm || null, ring_gauge || null, description || null,
+        imageUrl, userId,
+      ];
+    } else {
+      insertQuery = `
+        INSERT INTO cigars
+          (brand_id, name, country_id, strength, avg_price,
+           length_mm, ring_gauge, description, image_url, submitted_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        RETURNING id`;
+      insertParams = [
+        brandId, model_name,
+        country_id || null, strength || null, avg_price || null,
+        length_mm || null, ring_gauge || null, description || null,
+        imageUrl, userId,
+      ];
+    }
+
+    const { rows } = await client.query(insertQuery, insertParams);
     const cigarId = rows[0].id;
 
-    // Action selon destination
+    // Destination
     if (destination === 'cave') {
       await client.query(
-        'INSERT INTO user_cave (user_id, cigar_id, quantity) VALUES ($1,$2,1) ON CONFLICT (user_id, cigar_id) DO UPDATE SET quantity = user_cave.quantity + 1',
-        [userId, cigarId]
-      );
+        `INSERT INTO user_cave (user_id, cigar_id, quantity) VALUES ($1,$2,1)
+         ON CONFLICT (user_id, cigar_id) DO UPDATE SET quantity = user_cave.quantity + 1`,
+        [userId, cigarId]);
     } else if (destination === 'wishlist') {
       await client.query(
         'INSERT INTO user_wishlist (user_id, cigar_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
-        [userId, cigarId]
-      );
+        [userId, cigarId]);
     }
 
     await client.query('COMMIT');
