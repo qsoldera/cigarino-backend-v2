@@ -1,0 +1,215 @@
+const db = require('../config/database');
+
+async function getProfile(req, res) {
+  const userId = req.user.id;
+  try {
+    const [scanRes, avgRes, favRes] = await Promise.all([
+      db.query('SELECT COUNT(*) FROM user_scans WHERE user_id=$1', [userId]),
+      db.query('SELECT ROUND(AVG(rating)::numeric,2) as avg FROM user_scans WHERE user_id=$1', [userId]),
+      db.query('SELECT COUNT(*) FROM user_favorites WHERE user_id=$1', [userId]),
+    ]);
+    const { password_hash, ...user } = req.user;
+    res.json({
+      ...user,
+      total_scans: parseInt(scanRes.rows[0].count),
+      avg_rating: parseFloat(avgRes.rows[0].avg) || 0,
+      total_favorites: parseInt(favRes.rows[0].count),
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur profil' });
+  }
+}
+
+async function updateAvatar(req, res) {
+  if (!req.file) return res.status(400).json({ error: 'Photo requise' });
+  try {
+    const { rows } = await db.query(
+      'UPDATE users SET avatar_url=$1 WHERE id=$2 RETURNING avatar_url',
+      [req.file.path, req.user.id]
+    );
+    res.json({ avatar_url: rows[0].avatar_url });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur mise à jour avatar' });
+  }
+}
+
+// --- Cave ---
+async function getCave(req, res) {
+  const { sort = 'date' } = req.query;
+  const order = {
+    date: 'uc.added_at DESC',
+    brand: 'b.name ASC',
+    rating: 'avg_rating DESC NULLS LAST',
+    price: 'COALESCE(c.admin_avg_price,c.avg_price) ASC NULLS LAST',
+  }[sort] || 'uc.added_at DESC';
+
+  try {
+    const { rows } = await db.query(`
+      SELECT uc.id, uc.quantity, uc.added_at,
+        c.id as cigar_id, b.name as brand, c.name as model,
+        COALESCE(c.admin_image_url, c.image_url) as image_url,
+        COALESCE(c.admin_avg_price, c.avg_price) as avg_price,
+        CASE WHEN SUM(u.reputation_score) > 0
+          THEN ROUND(SUM(us.rating * u.reputation_score)::numeric / SUM(u.reputation_score), 2)
+          ELSE COALESCE(ROUND(AVG(us.rating)::numeric, 2), 0)
+        END as avg_rating
+      FROM user_cave uc
+      JOIN cigars c ON uc.cigar_id = c.id
+      JOIN brands b ON c.brand_id = b.id
+      LEFT JOIN user_scans us ON us.cigar_id = c.id
+      LEFT JOIN users u ON us.user_id = u.id
+      WHERE uc.user_id=$1
+      GROUP BY uc.id, c.id, b.name
+      ORDER BY ${order}
+    `, [req.user.id]);
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur cave' });
+  }
+}
+
+async function addToCave(req, res) {
+  const { cigar_id, quantity = 1 } = req.body;
+  try {
+    await db.query(
+      `INSERT INTO user_cave (user_id, cigar_id, quantity)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (user_id, cigar_id) DO UPDATE SET quantity = user_cave.quantity + $3`,
+      [req.user.id, cigar_id, quantity]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur ajout cave' });
+  }
+}
+
+async function removeFromCave(req, res) {
+  try {
+    await db.query('DELETE FROM user_cave WHERE user_id=$1 AND cigar_id=$2', [req.user.id, req.params.cigar_id]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur suppression cave' });
+  }
+}
+
+// --- Carnet ---
+async function getCarnet(req, res) {
+  const { sort = 'date' } = req.query;
+  const order = {
+    date: 'us.created_at DESC',
+    rating: 'us.rating DESC',
+    brand: 'b.name ASC',
+  }[sort] || 'us.created_at DESC';
+
+  try {
+    const { rows } = await db.query(`
+      SELECT us.id, us.rating, us.created_at, us.public_review, us.finish_note,
+        us.intensity, us.complexity, us.draw, us.duration, us.pairing,
+        us.ash_color, us.smoke_consistency,
+        c.id as cigar_id, b.name as brand, c.name as model,
+        COALESCE(c.admin_image_url, c.image_url) as image_url,
+        array_agg(DISTINCT sf.flavor) FILTER (WHERE sf.flavor IS NOT NULL) as flavors,
+        array_agg(DISTINCT sm.moment) FILTER (WHERE sm.moment IS NOT NULL) as moments
+      FROM user_scans us
+      JOIN cigars c ON us.cigar_id = c.id
+      JOIN brands b ON c.brand_id = b.id
+      LEFT JOIN scan_flavors sf ON sf.scan_id = us.id
+      LEFT JOIN scan_moments sm ON sm.scan_id = us.id
+      WHERE us.user_id=$1
+      GROUP BY us.id, c.id, b.name
+      ORDER BY ${order}
+    `, [req.user.id]);
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur carnet' });
+  }
+}
+
+async function deleteScan(req, res) {
+  try {
+    const { rows } = await db.query(
+      'DELETE FROM user_scans WHERE id=$1 AND user_id=$2 RETURNING cigar_id',
+      [req.params.scan_id, req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Scan introuvable' });
+    await db.query('UPDATE cigars SET scan_count = GREATEST(0, scan_count - 1) WHERE id=$1', [rows[0].cigar_id]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur suppression scan' });
+  }
+}
+
+// --- Favoris ---
+async function getFavorites(req, res) {
+  const { sort = 'rating' } = req.query;
+  try {
+    const { rows } = await db.query(`
+      SELECT uf.created_at as favorited_at,
+        c.id as cigar_id, b.name as brand, c.name as model,
+        COALESCE(c.admin_image_url, c.image_url) as image_url,
+        COALESCE(c.admin_avg_price, c.avg_price) as avg_price,
+        CASE WHEN SUM(u.reputation_score) > 0
+          THEN ROUND(SUM(us.rating * u.reputation_score)::numeric / SUM(u.reputation_score), 2)
+          ELSE COALESCE(ROUND(AVG(us.rating)::numeric, 2), 0)
+        END as avg_rating,
+        COUNT(us.id) as my_tastings
+      FROM user_favorites uf
+      JOIN cigars c ON uf.cigar_id = c.id
+      JOIN brands b ON c.brand_id = b.id
+      LEFT JOIN user_scans us ON us.cigar_id = c.id AND us.user_id = $1
+      LEFT JOIN users u ON us.user_id = u.id
+      WHERE uf.user_id=$1
+      GROUP BY uf.created_at, c.id, b.name
+      ORDER BY avg_rating DESC NULLS LAST
+    `, [req.user.id]);
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur favoris' });
+  }
+}
+
+// --- Wishlist ---
+async function getWishlist(req, res) {
+  try {
+    const { rows } = await db.query(`
+      SELECT uw.created_at as added_at,
+        c.id as cigar_id, b.name as brand, c.name as model,
+        COALESCE(c.admin_image_url, c.image_url) as image_url,
+        COALESCE(c.admin_avg_price, c.avg_price) as avg_price,
+        co.name as country,
+        CASE WHEN SUM(u.reputation_score) > 0
+          THEN ROUND(SUM(us.rating * u.reputation_score)::numeric / SUM(u.reputation_score), 2)
+          ELSE COALESCE(ROUND(AVG(us.rating)::numeric, 2), 0)
+        END as avg_rating
+      FROM user_wishlist uw
+      JOIN cigars c ON uw.cigar_id = c.id
+      JOIN brands b ON c.brand_id = b.id
+      LEFT JOIN countries co ON COALESCE(c.admin_country_id, c.country_id) = co.id
+      LEFT JOIN user_scans us ON us.cigar_id = c.id
+      LEFT JOIN users u ON us.user_id = u.id
+      WHERE uw.user_id=$1
+      GROUP BY uw.created_at, c.id, b.name, co.name
+      ORDER BY uw.created_at DESC
+    `, [req.user.id]);
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur wishlist' });
+  }
+}
+
+async function removeFromWishlist(req, res) {
+  try {
+    await db.query('DELETE FROM user_wishlist WHERE user_id=$1 AND cigar_id=$2', [req.user.id, req.params.cigar_id]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur suppression wishlist' });
+  }
+}
+
+module.exports = {
+  getProfile, updateAvatar,
+  getCave, addToCave, removeFromCave,
+  getCarnet, deleteScan,
+  getFavorites,
+  getWishlist, removeFromWishlist,
+};
