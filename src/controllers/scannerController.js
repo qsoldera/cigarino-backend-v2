@@ -1,5 +1,7 @@
 const db = require('../config/database');
+const { fingerprint } = require('../utils/normalize');
 
+// ─── Scan photo ───────────────────────────────────────────────────────────────
 async function scan(req, res) {
   if (!req.file) return res.status(400).json({ error: 'Photo requise' });
   const imageUrl = req.file.path;
@@ -20,8 +22,7 @@ async function scan(req, res) {
       LEFT JOIN user_scans us ON us.cigar_id = c.id
       LEFT JOIN users u ON us.user_id = u.id
       GROUP BY sl.cigar_id, sl.confidence, c.id, b.name
-      ORDER BY sl.confidence DESC
-      LIMIT 5
+      ORDER BY sl.confidence DESC LIMIT 5
     `);
     res.json({ image_url: imageUrl, results: labels });
   } catch (e) {
@@ -30,9 +31,13 @@ async function scan(req, res) {
   }
 }
 
+// ─── Soumission d'un nouveau cigare ──────────────────────────────────────────
 async function submitNewCigar(req, res) {
-  const { brand_name, model_name, country_id, strength, avg_price,
-    length_mm, ring_gauge, description, destination } = req.body;
+  const {
+    brand_name, model_name, country_id, strength, avg_price,
+    length_mm, ring_gauge, description, destination,
+  } = req.body;
+
   const userId  = req.user.id;
   const isAdmin = req.user.is_admin;
   const imageUrl = req.file?.path || null;
@@ -40,57 +45,108 @@ async function submitNewCigar(req, res) {
   if (!brand_name || !model_name)
     return res.status(400).json({ error: 'Marque et modèle requis' });
 
+  // ── Empreintes normalisées ─────────────────────────────────────────────────
+  const brandFP = fingerprint(brand_name);
+  const cigarFP = fingerprint(model_name);
+
   const client = await db.connect();
   try {
     await client.query('BEGIN');
 
-    // Marque (upsert)
+    // ── 1. Trouver ou créer la marque ──────────────────────────────────────
     let brandId;
-    const brandRes = await client.query(
-      'SELECT id FROM brands WHERE name ILIKE $1', [brand_name]);
-    if (brandRes.rows.length) {
-      brandId = brandRes.rows[0].id;
+
+    // Recherche par fingerprint (robuste aux accents/ponctuation)
+    const byFP = await client.query(
+      'SELECT id FROM brands WHERE name_normalized = $1', [brandFP]);
+
+    if (byFP.rows.length) {
+      brandId = byFP.rows[0].id;
     } else {
-      const b = await client.query(
-        'INSERT INTO brands (name) VALUES ($1) RETURNING id', [brand_name]);
-      brandId = b.rows[0].id;
+      // Fallback : correspondance exacte insensible à la casse
+      const byName = await client.query(
+        'SELECT id FROM brands WHERE LOWER(name) = LOWER($1)', [brand_name]);
+
+      if (byName.rows.length) {
+        brandId = byName.rows[0].id;
+        // Rétro-remplir le fingerprint si absent
+        await client.query(
+          'UPDATE brands SET name_normalized = $1 WHERE id = $2 AND name_normalized IS NULL',
+          [brandFP, brandId]);
+      } else {
+        // Nouvelle marque
+        const b = await client.query(
+          'INSERT INTO brands (name, name_normalized) VALUES ($1, $2) RETURNING id',
+          [brand_name.trim(), brandFP]);
+        brandId = b.rows[0].id;
+      }
     }
 
-    // Si admin → colonnes admin_* + admin_verified = TRUE
-    let insertQuery, insertParams;
-    if (isAdmin) {
-      insertQuery = `
-        INSERT INTO cigars
-          (brand_id, name, admin_country_id, admin_strength, admin_avg_price,
-           admin_length_mm, admin_ring_gauge, admin_description,
-           admin_image_url, admin_verified, submitted_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10)
-        RETURNING id`;
-      insertParams = [
-        brandId, model_name,
-        country_id || null, strength || null, avg_price || null,
-        length_mm || null, ring_gauge || null, description || null,
-        imageUrl, userId,
-      ];
+    // ── 2. Chercher un cigare existant avec le même fingerprint ────────────
+    const existing = await client.query(
+      'SELECT id FROM cigars WHERE brand_id = $1 AND name_normalized = $2',
+      [brandId, cigarFP]);
+
+    let cigarId;
+    let merged = false;
+
+    if (existing.rows.length) {
+      // ── Cigare déjà en base → réutiliser la fiche existante ──────────────
+      cigarId = existing.rows[0].id;
+      merged  = true;
+
+      // Si l'admin soumet une image et qu'il n'y en a pas encore, on la pose
+      if (imageUrl && isAdmin) {
+        await client.query(
+          `UPDATE cigars
+             SET admin_image_url = COALESCE(admin_image_url, $1),
+                 admin_verified  = TRUE
+           WHERE id = $2`,
+          [imageUrl, cigarId]);
+      }
     } else {
-      insertQuery = `
-        INSERT INTO cigars
-          (brand_id, name, country_id, strength, avg_price,
-           length_mm, ring_gauge, description, image_url, submitted_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-        RETURNING id`;
-      insertParams = [
-        brandId, model_name,
-        country_id || null, strength || null, avg_price || null,
-        length_mm || null, ring_gauge || null, description || null,
-        imageUrl, userId,
-      ];
+      // ── Nouveau cigare ────────────────────────────────────────────────────
+      let insertQuery, insertParams;
+
+      if (isAdmin) {
+        // Admin → colonnes admin_* + admin_verified = TRUE d'emblée
+        insertQuery = `
+          INSERT INTO cigars
+            (brand_id, name, name_normalized,
+             admin_country_id, admin_strength, admin_avg_price,
+             admin_length_mm, admin_ring_gauge, admin_description,
+             admin_image_url, admin_verified, submitted_by)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,TRUE,$11)
+          RETURNING id`;
+        insertParams = [
+          brandId, model_name.trim(), cigarFP,
+          country_id || null, strength || null, avg_price || null,
+          length_mm || null, ring_gauge || null, description || null,
+          imageUrl, userId,
+        ];
+      } else {
+        // Utilisateur standard → colonnes communautaires
+        insertQuery = `
+          INSERT INTO cigars
+            (brand_id, name, name_normalized,
+             country_id, strength, avg_price,
+             length_mm, ring_gauge, description,
+             image_url, submitted_by)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          RETURNING id`;
+        insertParams = [
+          brandId, model_name.trim(), cigarFP,
+          country_id || null, strength || null, avg_price || null,
+          length_mm || null, ring_gauge || null, description || null,
+          imageUrl, userId,
+        ];
+      }
+
+      const { rows } = await client.query(insertQuery, insertParams);
+      cigarId = rows[0].id;
     }
 
-    const { rows } = await client.query(insertQuery, insertParams);
-    const cigarId = rows[0].id;
-
-    // Destination
+    // ── 3. Gérer la destination ────────────────────────────────────────────
     if (destination === 'cave') {
       await client.query(
         `INSERT INTO user_cave (user_id, cigar_id, quantity) VALUES ($1,$2,1)
@@ -103,7 +159,8 @@ async function submitNewCigar(req, res) {
     }
 
     await client.query('COMMIT');
-    res.status(201).json({ cigar_id: cigarId, success: true });
+    res.status(201).json({ cigar_id: cigarId, success: true, merged });
+
   } catch (e) {
     await client.query('ROLLBACK');
     console.error(e);
