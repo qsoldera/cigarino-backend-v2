@@ -3,19 +3,25 @@ const db = require('../config/database');
 async function getProfile(req, res) {
   const userId = req.user.id;
   try {
-    const [scanRes, avgRes, favRes] = await Promise.all([
+    const [scanRes, avgRes, favRes, caveRes, wishRes] = await Promise.all([
       db.query('SELECT COUNT(*) FROM user_scans WHERE user_id=$1', [userId]),
       db.query('SELECT ROUND(AVG(rating)::numeric,2) as avg FROM user_scans WHERE user_id=$1', [userId]),
       db.query('SELECT COUNT(*) FROM user_favorites WHERE user_id=$1', [userId]),
+      db.query('SELECT COUNT(*) as count, COALESCE(SUM(quantity),0) as total FROM user_cave WHERE user_id=$1', [userId]),
+      db.query('SELECT COUNT(*) FROM user_wishlist WHERE user_id=$1', [userId]),
     ]);
     const { password_hash, ...user } = req.user;
     res.json({
       ...user,
-      total_scans: parseInt(scanRes.rows[0].count),
-      avg_rating: parseFloat(avgRes.rows[0].avg) || 0,
-      total_favorites: parseInt(favRes.rows[0].count),
+      total_scans:         parseInt(scanRes.rows[0].count),
+      avg_rating:          parseFloat(avgRes.rows[0].avg) || 0,
+      total_favorites:     parseInt(favRes.rows[0].count),
+      cave_references:     parseInt(caveRes.rows[0].count),   // nb de références
+      cave_total_cigars:   parseInt(caveRes.rows[0].total),   // nb total d'unités
+      wishlist_count:      parseInt(wishRes.rows[0].count),
     });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: 'Erreur profil' });
   }
 }
@@ -28,19 +34,17 @@ async function updateAvatar(req, res) {
       [req.file.path, req.user.id]
     );
     res.json({ avatar_url: rows[0].avatar_url });
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur mise à jour avatar' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur mise à jour avatar' }); }
 }
 
-// --- Cave ---
+// ── Cave ──────────────────────────────────────────────────────────────────────
 async function getCave(req, res) {
   const { sort = 'date' } = req.query;
   const order = {
-    date: 'uc.added_at DESC',
-    brand: 'b.name ASC',
+    date:   'uc.added_at DESC',
+    brand:  'b.name ASC',
     rating: 'avg_rating DESC NULLS LAST',
-    price: 'COALESCE(c.admin_avg_price,c.avg_price) ASC NULLS LAST',
+    price:  'COALESCE(c.admin_avg_price,c.avg_price) ASC NULLS LAST',
   }[sort] || 'uc.added_at DESC';
 
   try {
@@ -63,9 +67,7 @@ async function getCave(req, res) {
       ORDER BY ${order}
     `, [req.user.id]);
     res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur cave' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur cave' }); }
 }
 
 async function addToCave(req, res) {
@@ -74,31 +76,72 @@ async function addToCave(req, res) {
     await db.query(
       `INSERT INTO user_cave (user_id, cigar_id, quantity)
        VALUES ($1,$2,$3)
-       ON CONFLICT (user_id, cigar_id) DO UPDATE SET quantity = user_cave.quantity + $3`,
+       ON CONFLICT (user_id, cigar_id)
+       DO UPDATE SET quantity = user_cave.quantity + $3`,
       [req.user.id, cigar_id, quantity]
     );
     res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur ajout cave' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur ajout cave' }); }
 }
 
 async function removeFromCave(req, res) {
   try {
-    await db.query('DELETE FROM user_cave WHERE user_id=$1 AND cigar_id=$2', [req.user.id, req.params.cigar_id]);
+    await db.query('DELETE FROM user_cave WHERE user_id=$1 AND cigar_id=$2',
+      [req.user.id, req.params.cigar_id]);
     res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur suppression cave' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur suppression cave' }); }
 }
 
-// --- Carnet ---
+// Décrémente de 1, supprime si quantité tombe à 0
+async function decrementCave(req, res) {
+  try {
+    const { rows } = await db.query(
+      `UPDATE user_cave SET quantity = quantity - 1
+       WHERE user_id=$1 AND cigar_id=$2
+       RETURNING quantity`,
+      [req.user.id, req.params.cigar_id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Non trouvé en cave' });
+    const qty = rows[0].quantity;
+    if (qty <= 0) {
+      await db.query('DELETE FROM user_cave WHERE user_id=$1 AND cigar_id=$2',
+        [req.user.id, req.params.cigar_id]);
+    }
+    res.json({ quantity: Math.max(0, qty), removed: qty <= 0 });
+  } catch (e) { res.status(500).json({ error: 'Erreur décrémentation cave' }); }
+}
+
+// Mise à jour manuelle de la quantité et/ou de la date
+async function updateCaveItem(req, res) {
+  const { quantity, added_at } = req.body;
+  if (quantity !== undefined && quantity <= 0) {
+    await db.query('DELETE FROM user_cave WHERE user_id=$1 AND cigar_id=$2',
+      [req.user.id, req.params.cigar_id]);
+    return res.json({ removed: true });
+  }
+  const sets = [];
+  const params = [];
+  let idx = 1;
+  if (quantity  !== undefined) { sets.push(`quantity=$${idx++}`);  params.push(quantity); }
+  if (added_at  !== undefined) { sets.push(`added_at=$${idx++}`);  params.push(added_at); }
+  if (!sets.length) return res.status(400).json({ error: 'Rien à modifier' });
+  params.push(req.user.id, req.params.cigar_id);
+  try {
+    await db.query(
+      `UPDATE user_cave SET ${sets.join(',')} WHERE user_id=$${idx} AND cigar_id=$${idx+1}`,
+      params
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Erreur mise à jour cave' }); }
+}
+
+// ── Carnet ────────────────────────────────────────────────────────────────────
 async function getCarnet(req, res) {
   const { sort = 'date' } = req.query;
   const order = {
-    date: 'us.created_at DESC',
+    date:   'us.created_at DESC',
     rating: 'us.rating DESC',
-    brand: 'b.name ASC',
+    brand:  'b.name ASC',
   }[sort] || 'us.created_at DESC';
 
   try {
@@ -120,9 +163,7 @@ async function getCarnet(req, res) {
       ORDER BY ${order}
     `, [req.user.id]);
     res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur carnet' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur carnet' }); }
 }
 
 async function deleteScan(req, res) {
@@ -132,16 +173,14 @@ async function deleteScan(req, res) {
       [req.params.scan_id, req.user.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'Scan introuvable' });
-    await db.query('UPDATE cigars SET scan_count = GREATEST(0, scan_count - 1) WHERE id=$1', [rows[0].cigar_id]);
+    await db.query('UPDATE cigars SET scan_count = GREATEST(0, scan_count - 1) WHERE id=$1',
+      [rows[0].cigar_id]);
     res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur suppression scan' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur suppression scan' }); }
 }
 
-// --- Favoris ---
+// ── Favoris ───────────────────────────────────────────────────────────────────
 async function getFavorites(req, res) {
-  const { sort = 'rating' } = req.query;
   try {
     const { rows } = await db.query(`
       SELECT uf.created_at as favorited_at,
@@ -163,12 +202,10 @@ async function getFavorites(req, res) {
       ORDER BY avg_rating DESC NULLS LAST
     `, [req.user.id]);
     res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur favoris' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur favoris' }); }
 }
 
-// --- Wishlist ---
+// ── Wishlist ──────────────────────────────────────────────────────────────────
 async function getWishlist(req, res) {
   try {
     const { rows } = await db.query(`
@@ -192,23 +229,20 @@ async function getWishlist(req, res) {
       ORDER BY uw.created_at DESC
     `, [req.user.id]);
     res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur wishlist' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur wishlist' }); }
 }
 
 async function removeFromWishlist(req, res) {
   try {
-    await db.query('DELETE FROM user_wishlist WHERE user_id=$1 AND cigar_id=$2', [req.user.id, req.params.cigar_id]);
+    await db.query('DELETE FROM user_wishlist WHERE user_id=$1 AND cigar_id=$2',
+      [req.user.id, req.params.cigar_id]);
     res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur suppression wishlist' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur suppression wishlist' }); }
 }
 
 module.exports = {
   getProfile, updateAvatar,
-  getCave, addToCave, removeFromCave,
+  getCave, addToCave, removeFromCave, decrementCave, updateCaveItem,
   getCarnet, deleteScan,
   getFavorites,
   getWishlist, removeFromWishlist,

@@ -79,7 +79,7 @@ async function topRated(req, res) {
       LEFT JOIN user_scans us ON us.cigar_id = c.id
       LEFT JOIN users u ON us.user_id = u.id
       GROUP BY c.id, b.name, co.name
-      HAVING COUNT(us.id) >= 2
+      HAVING COUNT(us.id) >= 1
       ORDER BY avg_rating DESC, rating_count DESC LIMIT 6
     `);
     res.json(rows);
@@ -106,7 +106,7 @@ async function bestValue(req, res) {
       LEFT JOIN users u ON us.user_id = u.id
       WHERE COALESCE(c.admin_avg_price, c.avg_price) >= 3.50
       GROUP BY c.id, b.name, co.name
-      HAVING COUNT(us.id) >= 2
+      HAVING COUNT(us.id) >= 1
       ORDER BY qp_ratio DESC LIMIT 6
     `);
     res.json(rows);
