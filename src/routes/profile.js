@@ -11,7 +11,7 @@ const {
 } = require('../controllers/profileController');
 
 router.get('/', auth, getProfile);
-router.post('/avatar', auth, uploadAvatar.single('avatar'), updateAvatar);
+router.post('/avatar', auth, ...uploadAvatar.single('avatar'), updateAvatar);
 
 router.get('/cave', auth, getCave);
 router.post('/cave', auth, addToCave);
