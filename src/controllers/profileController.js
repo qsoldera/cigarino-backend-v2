@@ -7,21 +7,26 @@ async function getProfile(req, res) {
       db.query('SELECT COUNT(*) FROM user_scans WHERE user_id=$1', [userId]),
       db.query('SELECT ROUND(AVG(rating)::numeric,2) as avg FROM user_scans WHERE user_id=$1', [userId]),
       db.query('SELECT COUNT(*) FROM user_favorites WHERE user_id=$1', [userId]),
-      db.query('SELECT COUNT(*) as count, COALESCE(SUM(quantity),0) as total FROM user_cave WHERE user_id=$1', [userId]),
+      db.query(`
+        SELECT
+          COUNT(*)::int          AS cave_references,
+          COALESCE(SUM(quantity),0)::int AS cave_total
+        FROM user_cave WHERE user_id=$1
+      `, [userId]),
       db.query('SELECT COUNT(*) FROM user_wishlist WHERE user_id=$1', [userId]),
     ]);
     const { password_hash, ...user } = req.user;
     res.json({
       ...user,
-      total_scans:         parseInt(scanRes.rows[0].count),
-      avg_rating:          parseFloat(avgRes.rows[0].avg) || 0,
-      total_favorites:     parseInt(favRes.rows[0].count),
-      cave_references:     parseInt(caveRes.rows[0].count),   // nb de références
-      cave_total_cigars:   parseInt(caveRes.rows[0].total),   // nb total d'unités
-      wishlist_count:      parseInt(wishRes.rows[0].count),
+      total_scans:       parseInt(scanRes.rows[0].count),
+      avg_rating:        parseFloat(avgRes.rows[0].avg) || 0,
+      total_favorites:   parseInt(favRes.rows[0].count),
+      cave_references:   caveRes.rows[0].cave_references,
+      cave_total_cigars: caveRes.rows[0].cave_total,
+      wishlist_count:    parseInt(wishRes.rows[0].count),
     });
   } catch (e) {
-    console.error(e);
+    console.error('getProfile error:', e);
     res.status(500).json({ error: 'Erreur profil' });
   }
 }
@@ -34,7 +39,7 @@ async function updateAvatar(req, res) {
       [req.file.path, req.user.id]
     );
     res.json({ avatar_url: rows[0].avatar_url });
-  } catch (e) { res.status(500).json({ error: 'Erreur mise à jour avatar' }); }
+  } catch (e) { res.status(500).json({ error: 'Erreur avatar' }); }
 }
 
 // ── Cave ──────────────────────────────────────────────────────────────────────
@@ -46,7 +51,6 @@ async function getCave(req, res) {
     rating: 'avg_rating DESC NULLS LAST',
     price:  'COALESCE(c.admin_avg_price,c.avg_price) ASC NULLS LAST',
   }[sort] || 'uc.added_at DESC';
-
   try {
     const { rows } = await db.query(`
       SELECT uc.id, uc.quantity, uc.added_at,
@@ -78,8 +82,7 @@ async function addToCave(req, res) {
        VALUES ($1,$2,$3)
        ON CONFLICT (user_id, cigar_id)
        DO UPDATE SET quantity = user_cave.quantity + $3`,
-      [req.user.id, cigar_id, quantity]
-    );
+      [req.user.id, cigar_id, quantity]);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Erreur ajout cave' }); }
 }
@@ -92,47 +95,63 @@ async function removeFromCave(req, res) {
   } catch (e) { res.status(500).json({ error: 'Erreur suppression cave' }); }
 }
 
-// Décrémente de 1, supprime si quantité tombe à 0
 async function decrementCave(req, res) {
+  const client = await db.connect();
   try {
-    const { rows } = await db.query(
+    await client.query('BEGIN');
+    const { rows } = await client.query(
       `UPDATE user_cave SET quantity = quantity - 1
-       WHERE user_id=$1 AND cigar_id=$2
-       RETURNING quantity`,
-      [req.user.id, req.params.cigar_id]
-    );
-    if (!rows.length) return res.status(404).json({ error: 'Non trouvé en cave' });
+       WHERE user_id=$1 AND cigar_id=$2 RETURNING quantity`,
+      [req.user.id, req.params.cigar_id]);
+    if (!rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Non trouvé' }); }
     const qty = rows[0].quantity;
     if (qty <= 0) {
-      await db.query('DELETE FROM user_cave WHERE user_id=$1 AND cigar_id=$2',
+      await client.query('DELETE FROM user_cave WHERE user_id=$1 AND cigar_id=$2',
         [req.user.id, req.params.cigar_id]);
     }
+    await client.query('COMMIT');
     res.json({ quantity: Math.max(0, qty), removed: qty <= 0 });
-  } catch (e) { res.status(500).json({ error: 'Erreur décrémentation cave' }); }
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('decrementCave:', e);
+    res.status(500).json({ error: 'Erreur décrémentation' });
+  } finally { client.release(); }
 }
 
-// Mise à jour manuelle de la quantité et/ou de la date
 async function updateCaveItem(req, res) {
   const { quantity, added_at } = req.body;
-  if (quantity !== undefined && quantity <= 0) {
-    await db.query('DELETE FROM user_cave WHERE user_id=$1 AND cigar_id=$2',
-      [req.user.id, req.params.cigar_id]);
-    return res.json({ removed: true });
+  const userId   = req.user.id;
+  const cigarId  = req.params.cigar_id;
+
+  console.log('updateCaveItem', { userId, cigarId, quantity, added_at });
+
+  if (quantity !== undefined && parseInt(quantity) <= 0) {
+    try {
+      await db.query('DELETE FROM user_cave WHERE user_id=$1 AND cigar_id=$2', [userId, cigarId]);
+      return res.json({ removed: true });
+    } catch (e) { return res.status(500).json({ error: 'Erreur suppression' }); }
   }
-  const sets = [];
+
+  const sets   = [];
   const params = [];
-  let idx = 1;
-  if (quantity  !== undefined) { sets.push(`quantity=$${idx++}`);  params.push(quantity); }
+  let   idx    = 1;
+
+  if (quantity  !== undefined) { sets.push(`quantity=$${idx++}`);  params.push(parseInt(quantity)); }
   if (added_at  !== undefined) { sets.push(`added_at=$${idx++}`);  params.push(added_at); }
+
   if (!sets.length) return res.status(400).json({ error: 'Rien à modifier' });
-  params.push(req.user.id, req.params.cigar_id);
+
+  params.push(userId, cigarId);
   try {
-    await db.query(
-      `UPDATE user_cave SET ${sets.join(',')} WHERE user_id=$${idx} AND cigar_id=$${idx+1}`,
-      params
-    );
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: 'Erreur mise à jour cave' }); }
+    const result = await db.query(
+      `UPDATE user_cave SET ${sets.join(',')} WHERE user_id=$${idx} AND cigar_id=$${idx+1} RETURNING *`,
+      params);
+    console.log('updateCaveItem result:', result.rows);
+    res.json({ success: true, updated: result.rows[0] });
+  } catch (e) {
+    console.error('updateCaveItem error:', e);
+    res.status(500).json({ error: 'Erreur mise à jour cave' });
+  }
 }
 
 // ── Carnet ────────────────────────────────────────────────────────────────────
@@ -143,7 +162,6 @@ async function getCarnet(req, res) {
     rating: 'us.rating DESC',
     brand:  'b.name ASC',
   }[sort] || 'us.created_at DESC';
-
   try {
     const { rows } = await db.query(`
       SELECT us.id, us.rating, us.created_at, us.public_review, us.finish_note,
@@ -170,8 +188,7 @@ async function deleteScan(req, res) {
   try {
     const { rows } = await db.query(
       'DELETE FROM user_scans WHERE id=$1 AND user_id=$2 RETURNING cigar_id',
-      [req.params.scan_id, req.user.id]
-    );
+      [req.params.scan_id, req.user.id]);
     if (!rows.length) return res.status(404).json({ error: 'Scan introuvable' });
     await db.query('UPDATE cigars SET scan_count = GREATEST(0, scan_count - 1) WHERE id=$1',
       [rows[0].cigar_id]);

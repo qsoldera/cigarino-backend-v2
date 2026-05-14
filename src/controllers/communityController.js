@@ -13,9 +13,7 @@ async function searchUsers(req, res) {
       ORDER BY reputation_score DESC LIMIT 20
     `, [`%${q}%`]);
     res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur recherche utilisateurs' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur recherche' }); }
 }
 
 async function getPublicProfile(req, res) {
@@ -34,15 +32,13 @@ async function getPublicProfile(req, res) {
       GROUP BY u.id
     `, [username]);
     if (!rows.length) return res.status(404).json({ error: 'Utilisateur introuvable' });
-
     const user = rows[0];
     let is_following = false;
     if (viewerId) {
-      const f = await db.query('SELECT id FROM user_follows WHERE follower_id=$1 AND following_id=$2', [viewerId, user.id]);
+      const f = await db.query('SELECT id FROM user_follows WHERE follower_id=$1 AND following_id=$2',
+        [viewerId, user.id]);
       is_following = !!f.rows.length;
     }
-
-    // Dernières dégustations publiques
     const { rows: scans } = await db.query(`
       SELECT us.id, us.rating, us.created_at, us.public_review,
         c.id as cigar_id, b.name as brand, c.name as model,
@@ -53,55 +49,68 @@ async function getPublicProfile(req, res) {
       WHERE us.user_id=$1 AND us.public_review IS NOT NULL
       ORDER BY us.created_at DESC LIMIT 10
     `, [user.id]);
-
     res.json({ ...user, is_following, recent_scans: scans });
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur profil public' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur profil public' }); }
 }
 
 async function toggleFollow(req, res) {
   const followerId = req.user.id;
   const { user_id } = req.params;
-  if (followerId === parseInt(user_id)) return res.status(400).json({ error: 'Impossible de se suivre soi-même' });
+  if (followerId === parseInt(user_id))
+    return res.status(400).json({ error: 'Impossible de se suivre soi-même' });
   try {
-    const existing = await db.query('SELECT id FROM user_follows WHERE follower_id=$1 AND following_id=$2', [followerId, user_id]);
+    const existing = await db.query(
+      'SELECT id FROM user_follows WHERE follower_id=$1 AND following_id=$2',
+      [followerId, user_id]);
     if (existing.rows.length) {
-      await db.query('DELETE FROM user_follows WHERE follower_id=$1 AND following_id=$2', [followerId, user_id]);
+      await db.query('DELETE FROM user_follows WHERE follower_id=$1 AND following_id=$2',
+        [followerId, user_id]);
       res.json({ is_following: false });
     } else {
-      await db.query('INSERT INTO user_follows (follower_id, following_id) VALUES ($1,$2)', [followerId, user_id]);
+      await db.query('INSERT INTO user_follows (follower_id, following_id) VALUES ($1,$2)',
+        [followerId, user_id]);
       res.json({ is_following: true });
     }
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur follow' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur follow' }); }
 }
 
+// Feed enrichi : toutes les dégustations des abonnés, avec saveurs et infos cigare
 async function getFeed(req, res) {
   const userId = req.user.id;
   try {
     const { rows } = await db.query(`
-      SELECT 'tasting' as type, us.id, us.rating, us.created_at, us.public_review,
-        u.username, u.avatar_url, u.reputation_score,
+      SELECT
+        us.id, us.rating, us.created_at, us.public_review,
+        us.intensity, us.complexity, us.duration, us.pairing,
+        u.id as user_id, u.username, u.avatar_url, u.reputation_score,
         c.id as cigar_id, b.name as brand, c.name as model,
-        COALESCE(c.admin_image_url, c.image_url) as image_url
+        COALESCE(c.admin_image_url, c.image_url) as image_url,
+        COALESCE(c.admin_avg_price, c.avg_price) as avg_price,
+        COALESCE(c.admin_country_id, c.country_id) as country_id,
+        co.name as country,
+        array_agg(DISTINCT sf.flavor) FILTER (WHERE sf.flavor IS NOT NULL) as flavors,
+        array_agg(DISTINCT sm.moment) FILTER (WHERE sm.moment IS NOT NULL) as moments
       FROM user_scans us
       JOIN users u ON us.user_id = u.id
       JOIN cigars c ON us.cigar_id = c.id
       JOIN brands b ON c.brand_id = b.id
+      LEFT JOIN countries co ON COALESCE(c.admin_country_id, c.country_id) = co.id
+      LEFT JOIN scan_flavors sf ON sf.scan_id = us.id
+      LEFT JOIN scan_moments sm ON sm.scan_id = us.id
       WHERE us.user_id IN (
         SELECT following_id FROM user_follows WHERE follower_id=$1
       )
-      ORDER BY us.created_at DESC LIMIT 30
+      GROUP BY us.id, u.id, c.id, b.name, co.name
+      ORDER BY us.created_at DESC
+      LIMIT 50
     `, [userId]);
     res.json(rows);
   } catch (e) {
+    console.error('getFeed error:', e);
     res.status(500).json({ error: 'Erreur feed' });
   }
 }
 
-// --- Classements ---
 async function leaderboardTopCigars(req, res) {
   try {
     const { rows } = await db.query(`
@@ -119,14 +128,12 @@ async function leaderboardTopCigars(req, res) {
         AND us.created_at > NOW() - INTERVAL '30 days'
       LEFT JOIN users u ON us.user_id = u.id
       GROUP BY c.id, b.name
-      HAVING COUNT(us.id) >= 2
+      HAVING COUNT(us.id) >= 1
       ORDER BY avg_rating DESC, rating_count DESC
       LIMIT 10
     `);
     res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur classement' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur classement' }); }
 }
 
 async function leaderboardTopTasters(req, res) {
@@ -142,9 +149,7 @@ async function leaderboardTopTasters(req, res) {
       LIMIT 10
     `);
     res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur classement évaluateurs' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur classement évaluateurs' }); }
 }
 
 async function leaderboardByTerroir(req, res) {
@@ -166,19 +171,14 @@ async function leaderboardByTerroir(req, res) {
       HAVING COUNT(us.id) >= 1
       ORDER BY co.name, avg_rating DESC
     `);
-
-    // Grouper par pays, garder le meilleur
     const byCountry = {};
     for (const row of rows) {
       if (!byCountry[row.country]) byCountry[row.country] = row;
     }
     res.json(Object.values(byCountry));
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur classement terroir' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur classement terroir' }); }
 }
 
-// --- Challenges ---
 async function getChallenges(req, res) {
   try {
     const { rows } = await db.query(`
@@ -194,9 +194,7 @@ async function getChallenges(req, res) {
       ORDER BY ch.created_at DESC
     `);
     res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur challenges' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Erreur challenges' }); }
 }
 
 module.exports = {
