@@ -119,37 +119,55 @@ async function decrementCave(req, res) {
 }
 
 async function updateCaveItem(req, res) {
-  const { quantity, added_at } = req.body;
-  const userId   = req.user.id;
-  const cigarId  = req.params.cigar_id;
+  const userId  = req.user.id;
+  const cigarId = req.params.cigar_id;
+  const rawQty  = req.body.quantity;
+  const added_at = req.body.added_at;
 
-  console.log('updateCaveItem', { userId, cigarId, quantity, added_at });
+  console.log('[updateCaveItem] body:', req.body, 'user:', userId, 'cigar:', cigarId);
 
-  if (quantity !== undefined && parseInt(quantity) <= 0) {
+  const qty = rawQty !== undefined ? Number(rawQty) : undefined;
+
+  // Supprimer si quantité = 0
+  if (qty !== undefined && (isNaN(qty) || qty <= 0)) {
     try {
       await db.query('DELETE FROM user_cave WHERE user_id=$1 AND cigar_id=$2', [userId, cigarId]);
       return res.json({ removed: true });
-    } catch (e) { return res.status(500).json({ error: 'Erreur suppression' }); }
+    } catch (e) {
+      console.error('[updateCaveItem] delete error:', e);
+      return res.status(500).json({ error: 'Erreur suppression' });
+    }
   }
 
   const sets   = [];
   const params = [];
   let   idx    = 1;
 
-  if (quantity  !== undefined) { sets.push(`quantity=$${idx++}`);  params.push(parseInt(quantity)); }
-  if (added_at  !== undefined) { sets.push(`added_at=$${idx++}`);  params.push(added_at); }
+  if (qty !== undefined && !isNaN(qty)) {
+    sets.push(`quantity=$${idx++}`);
+    params.push(Math.round(qty));
+  }
+  if (added_at !== undefined && added_at !== null) {
+    sets.push(`added_at=$${idx++}`);
+    params.push(new Date(added_at));
+  }
 
   if (!sets.length) return res.status(400).json({ error: 'Rien à modifier' });
 
   params.push(userId, cigarId);
   try {
-    const result = await db.query(
-      `UPDATE user_cave SET ${sets.join(',')} WHERE user_id=$${idx} AND cigar_id=$${idx+1} RETURNING *`,
-      params);
-    console.log('updateCaveItem result:', result.rows);
-    res.json({ success: true, updated: result.rows[0] });
+    const sql = `UPDATE user_cave SET ${sets.join(',')}
+                 WHERE user_id=$${idx} AND cigar_id=$${idx+1}
+                 RETURNING id, quantity, added_at`;
+    console.log('[updateCaveItem] SQL:', sql, params);
+    const result = await db.query(sql, params);
+    console.log('[updateCaveItem] rows updated:', result.rowCount, result.rows);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Entrée cave introuvable' });
+    }
+    res.json({ success: true, row: result.rows[0] });
   } catch (e) {
-    console.error('updateCaveItem error:', e);
+    console.error('[updateCaveItem] error:', e);
     res.status(500).json({ error: 'Erreur mise à jour cave' });
   }
 }
