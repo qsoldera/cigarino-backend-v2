@@ -265,4 +265,93 @@ async function submitScan(req, res) {
   }
 }
 
-module.exports = { getCigar, toggleFavorite, toggleWishlist, reportCigar, submitScan };
+
+// ── Modifier une dégustation existante ───────────────────────────────────────
+async function updateScan(req, res) {
+  const { scan_id } = req.params;
+  const userId = req.user.id;
+  const {
+    rating, intensity, complexity, draw, duration,
+    raw_flavors, mouth_flavors, nose_flavors, finish_note, ash_color,
+    smoke_consistency, pairing, moments, price_paid, private_notes, public_review,
+  } = req.body;
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Vérifier que le scan appartient bien à l'utilisateur
+    const check = await client.query(
+      'SELECT id FROM user_scans WHERE id=$1 AND user_id=$2', [scan_id, userId]);
+    if (!check.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Dégustation introuvable' });
+    }
+
+    // Mise à jour des champs scalaires
+    await client.query(
+      `UPDATE user_scans SET
+        rating=$1, intensity=$2, complexity=$3, draw=$4, duration=$5,
+        finish_note=$6, ash_color=$7, smoke_consistency=$8, pairing=$9,
+        price_paid=$10, private_notes=$11, public_review=$12
+       WHERE id=$13`,
+      [rating, intensity||null, complexity||null, draw||null, duration||null,
+       finish_note||null, ash_color||null, smoke_consistency||null, pairing||null,
+       price_paid||null, private_notes||null, public_review||null, scan_id]
+    );
+
+    // Reconstruire les saveurs
+    await client.query('DELETE FROM scan_flavors WHERE scan_id=$1', [scan_id]);
+    const allFlavors = [
+      ...(raw_flavors||[]).map(f => ({ flavor: f, category: 'raw' })),
+      ...(mouth_flavors||[]).map(f => ({ flavor: f, category: 'mouth' })),
+      ...(nose_flavors||[]).map(f => ({ flavor: f, category: 'nose' })),
+    ];
+    for (const { flavor, category } of allFlavors) {
+      await client.query(
+        'INSERT INTO scan_flavors (scan_id, flavor, category) VALUES ($1,$2,$3)',
+        [scan_id, flavor, category]);
+    }
+
+    // Reconstruire les moments
+    await client.query('DELETE FROM scan_moments WHERE scan_id=$1', [scan_id]);
+    for (const moment of (moments||[])) {
+      await client.query('INSERT INTO scan_moments (scan_id, moment) VALUES ($1,$2)',
+        [scan_id, moment]);
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('updateScan error:', e);
+    res.status(500).json({ error: 'Erreur mise à jour dégustation' });
+  } finally {
+    client.release();
+  }
+}
+
+// ── Ajouter/remplacer photo (utilisateur) ─────────────────────────────────────
+async function addUserPhoto(req, res) {
+  if (!req.file) return res.status(400).json({ error: 'Photo requise' });
+  const { id } = req.params;
+  const isAdmin = req.user.is_admin;
+  try {
+    if (isAdmin) {
+      await db.query(
+        'UPDATE cigars SET admin_image_url=$1, admin_verified=TRUE WHERE id=$2',
+        [req.file.path, id]);
+    } else {
+      // Utilisateur : ne complète que si aucune image admin n'existe
+      await db.query(
+        'UPDATE cigars SET image_url=$1 WHERE id=$2 AND admin_image_url IS NULL',
+        [req.file.path, id]);
+    }
+    res.json({ image_url: req.file.path, success: true });
+  } catch (e) {
+    console.error('addUserPhoto error:', e);
+    res.status(500).json({ error: 'Erreur upload photo' });
+  }
+}
+
+module.exports = { getCigar, toggleFavorite, toggleWishlist, reportCigar, submitScan, updateScan, addUserPhoto };
