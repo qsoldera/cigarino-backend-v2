@@ -2,9 +2,10 @@ const db = require('../config/database');
 
 async function advancedSearch(req, res) {
   const {
-    countries, durations, flavors,
+    countries, flavors, moments,
     strength_value, strength_mode,
     price_min, price_max,
+    duration_max,
   } = req.body;
 
   let conditions = [];
@@ -14,12 +15,6 @@ async function advancedSearch(req, res) {
   if (countries?.length) {
     conditions.push(`co.name = ANY($${idx})`);
     params.push(countries);
-    idx++;
-  }
-
-  if (durations?.length) {
-    conditions.push(`us_agg.avg_duration = ANY($${idx})`);
-    params.push(durations);
     idx++;
   }
 
@@ -46,13 +41,35 @@ async function advancedSearch(req, res) {
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
-  // Filtre saveurs (HAVING)
-  let havingClause = '';
+  // HAVING : filtre saveurs + moments + durée max
+  const havingParts = [];
+
   if (flavors?.length) {
-    havingClause = `HAVING array_agg(DISTINCT sf.flavor) @> $${idx}::text[]`;
+    havingParts.push(`array_agg(DISTINCT sf.flavor) @> $${idx}::text[]`);
     params.push(flavors);
     idx++;
   }
+
+  if (moments?.length) {
+    havingParts.push(`array_agg(DISTINCT sm.moment) @> $${idx}::text[]`);
+    params.push(moments);
+    idx++;
+  }
+
+  if (duration_max) {
+    // '<30min' | '30-60min' | '60-90min' | '>90min'
+    // On filtre en excluant les durées au-delà du max choisi
+    const durationOrder = ['<30min', '30-60min', '60-90min', '>90min'];
+    const maxIdx = durationOrder.indexOf(duration_max);
+    if (maxIdx !== -1) {
+      const allowed = durationOrder.slice(0, maxIdx + 1);
+      havingParts.push(`(mode() WITHIN GROUP (ORDER BY us.duration) IS NULL OR mode() WITHIN GROUP (ORDER BY us.duration) = ANY($${idx}::text[]))`);
+      params.push(allowed);
+      idx++;
+    }
+  }
+
+  const havingClause = havingParts.length ? `HAVING ${havingParts.join(' AND ')}` : '';
 
   try {
     const { rows } = await db.query(`
@@ -83,6 +100,7 @@ async function advancedSearch(req, res) {
       LEFT JOIN user_scans us ON us.cigar_id = c.id
       LEFT JOIN users u ON us.user_id = u.id
       LEFT JOIN scan_flavors sf ON sf.scan_id = us.id
+      LEFT JOIN scan_moments sm ON sm.scan_id = us.id
       ${whereClause}
       GROUP BY c.id, b.name, co.name
       ${havingClause}
