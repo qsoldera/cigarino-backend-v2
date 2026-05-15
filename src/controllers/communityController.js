@@ -303,9 +303,174 @@ async function getMyFollowees(req, res) {
   } catch (e) { res.status(500).json({ error: 'Erreur abonnements' }); }
 }
 
+
+// ── Posts de groupe ───────────────────────────────────────────────────────────
+async function getGroupPosts(req, res) {
+  const { group_id } = req.params;
+  const userId = req.user.id;
+  try {
+    // Vérifier que l'utilisateur est membre
+    const member = await db.query(
+      'SELECT id FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
+      [group_id, userId]);
+    if (!member.rows.length) return res.status(403).json({ error: 'Non membre du groupe' });
+
+    const { rows } = await db.query(`
+      SELECT gp.id, gp.content, gp.image_url, gp.created_at,
+        u.username, u.avatar_url,
+        -- Évaluation partagée
+        us.id as scan_id, us.rating, us.public_review,
+        c.id as cigar_id, b.name as brand, c.name as model,
+        COALESCE(us.scan_image_url, c.admin_image_url, c.image_url) as cigar_image
+      FROM group_posts gp
+      JOIN users u ON gp.user_id = u.id
+      LEFT JOIN user_scans us ON gp.scan_id = us.id
+      LEFT JOIN cigars c ON us.cigar_id = c.id
+      LEFT JOIN brands b ON c.brand_id = b.id
+      WHERE gp.group_id = $1
+      ORDER BY gp.created_at DESC
+      LIMIT 50
+    `, [group_id]);
+    res.json(rows);
+  } catch (e) {
+    console.error('getGroupPosts:', e);
+    res.status(500).json({ error: 'Erreur posts' });
+  }
+}
+
+async function createGroupPost(req, res) {
+  const { group_id } = req.params;
+  const { content, scan_id } = req.body;
+  const userId = req.user.id;
+  const imageUrl = req.file?.path || null;
+
+  if (!content && !imageUrl && !scan_id)
+    return res.status(400).json({ error: 'Contenu, image ou évaluation requis' });
+
+  try {
+    const member = await db.query(
+      'SELECT id FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
+      [group_id, userId]);
+    if (!member.rows.length) return res.status(403).json({ error: 'Non membre du groupe' });
+
+    const { rows } = await db.query(
+      `INSERT INTO group_posts (group_id, user_id, content, image_url, scan_id)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+      [group_id, userId, content||null, imageUrl, scan_id||null]);
+    res.status(201).json({ post_id: rows[0].id });
+  } catch (e) {
+    console.error('createGroupPost:', e);
+    res.status(500).json({ error: 'Erreur création post' });
+  }
+}
+
+// ── Messages de groupe ────────────────────────────────────────────────────────
+async function getGroupMessages(req, res) {
+  const { group_id } = req.params;
+  const userId = req.user.id;
+  try {
+    const member = await db.query(
+      'SELECT id FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
+      [group_id, userId]);
+    if (!member.rows.length) return res.status(403).json({ error: 'Non membre' });
+
+    const { rows } = await db.query(`
+      SELECT gm.id, gm.content, gm.created_at,
+        u.username, u.avatar_url
+      FROM group_messages gm
+      JOIN users u ON gm.user_id = u.id
+      WHERE gm.group_id = $1
+      ORDER BY gm.created_at ASC
+      LIMIT 100
+    `, [group_id]);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: 'Erreur messages' }); }
+}
+
+async function sendGroupMessage(req, res) {
+  const { group_id } = req.params;
+  const { content } = req.body;
+  const userId = req.user.id;
+  if (!content?.trim()) return res.status(400).json({ error: 'Message vide' });
+
+  try {
+    const member = await db.query(
+      'SELECT id FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
+      [group_id, userId]);
+    if (!member.rows.length) return res.status(403).json({ error: 'Non membre' });
+
+    const { rows } = await db.query(
+      'INSERT INTO group_messages (group_id, user_id, content) VALUES ($1,$2,$3) RETURNING id',
+      [group_id, userId, content.trim()]);
+    res.status(201).json({ message_id: rows[0].id });
+  } catch (e) { res.status(500).json({ error: 'Erreur envoi message' }); }
+}
+
+// ── Évaluations agrégées du groupe ────────────────────────────────────────────
+async function getGroupScans(req, res) {
+  const { group_id } = req.params;
+  const userId = req.user.id;
+  try {
+    const member = await db.query(
+      'SELECT id FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
+      [group_id, userId]);
+    if (!member.rows.length) return res.status(403).json({ error: 'Non membre' });
+
+    const { rows } = await db.query(`
+      SELECT us.id, us.rating, us.public_review, us.created_at,
+        u.username, u.avatar_url,
+        c.id as cigar_id, b.name as brand, c.name as model,
+        COALESCE(us.scan_image_url, c.admin_image_url, c.image_url) as image_url,
+        ROUND(AVG(us2.rating) OVER (PARTITION BY c.id)::numeric, 2) as group_avg
+      FROM cigar_group_members gm
+      JOIN users u ON gm.user_id = u.id
+      JOIN user_scans us ON us.user_id = u.id
+      JOIN cigars c ON us.cigar_id = c.id
+      JOIN brands b ON c.brand_id = b.id
+      JOIN user_scans us2 ON us2.cigar_id = c.id
+        AND us2.user_id IN (
+          SELECT user_id FROM cigar_group_members WHERE group_id=$1
+        )
+      WHERE gm.group_id = $1
+      ORDER BY us.created_at DESC
+      LIMIT 50
+    `, [group_id]);
+    res.json(rows);
+  } catch (e) {
+    console.error('getGroupScans:', e);
+    res.status(500).json({ error: 'Erreur évaluations groupe' });
+  }
+}
+
+// ── Gestion des rôles (admin/créateur uniquement) ─────────────────────────────
+async function updateMemberRole(req, res) {
+  const { group_id, user_id } = req.params;
+  const { role } = req.body;
+  const requesterId = req.user.id;
+  const VALID_ROLES = ['admin', 'moderator', 'member'];
+  if (!VALID_ROLES.includes(role)) return res.status(400).json({ error: 'Rôle invalide' });
+
+  try {
+    // Vérifier que le demandeur est admin du groupe
+    const requester = await db.query(
+      "SELECT role FROM cigar_group_members WHERE group_id=$1 AND user_id=$2",
+      [group_id, requesterId]);
+    if (!requester.rows.length || requester.rows[0].role !== 'admin')
+      return res.status(403).json({ error: 'Réservé aux admins du groupe' });
+
+    await db.query(
+      'UPDATE cigar_group_members SET role=$1 WHERE group_id=$2 AND user_id=$3',
+      [role, group_id, user_id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Erreur mise à jour rôle' }); }
+}
+
 module.exports = {
   searchUsers, getPublicProfile, toggleFollow, getFeed,
   leaderboardTopCigars, leaderboardTopTasters,
   getMyGroups, createGroup, getGroupMembers, joinGroup, leaveGroup,
   getNearbyGroups, getMyFollowees,
+  getGroupPosts, createGroupPost,
+  getGroupMessages, sendGroupMessage,
+  getGroupScans, updateMemberRole,
 };

@@ -185,6 +185,7 @@ async function submitScan(req, res) {
     raw_flavors, mouth_flavors, nose_flavors, finish_note, ash_color,
     smoke_consistency, pairing, moments, price_paid, private_notes, public_review } = req.body;
   const userId = req.user.id;
+  const scanImageUrl = req.file?.path || null; // photo optionnelle prise lors de la dégustation
 
   if (!cigar_id || !rating) return res.status(400).json({ error: 'cigar_id et rating requis' });
 
@@ -195,13 +196,13 @@ async function submitScan(req, res) {
     const { rows } = await client.query(
       `INSERT INTO user_scans (user_id, cigar_id, rating, intensity, complexity, draw,
         duration, finish_note, ash_color, smoke_consistency, pairing, price_paid,
-        private_notes, public_review)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        private_notes, public_review, scan_image_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        RETURNING id`,
       [userId, cigar_id, rating, intensity || null, complexity || null, draw || null,
         duration || null, finish_note || null, ash_color || null,
         smoke_consistency || null, pairing || null, price_paid || null,
-        private_notes || null, public_review || null]
+        private_notes || null, public_review || null, scanImageUrl]
     );
     const scanId = rows[0].id;
 
@@ -289,15 +290,17 @@ async function updateScan(req, res) {
     }
 
     // Mise à jour des champs scalaires
+    const newScanImage = req.file?.path || null;
     await client.query(
       `UPDATE user_scans SET
         rating=$1, intensity=$2, complexity=$3, draw=$4, duration=$5,
         finish_note=$6, ash_color=$7, smoke_consistency=$8, pairing=$9,
-        price_paid=$10, private_notes=$11, public_review=$12
+        price_paid=$10, private_notes=$11, public_review=$12,
+        scan_image_url = COALESCE($14, scan_image_url)
        WHERE id=$13`,
       [rating, intensity||null, complexity||null, draw||null, duration||null,
        finish_note||null, ash_color||null, smoke_consistency||null, pairing||null,
-       price_paid||null, private_notes||null, public_review||null, scan_id]
+       price_paid||null, private_notes||null, public_review||null, scan_id, newScanImage]
     );
 
     // Reconstruire les saveurs
