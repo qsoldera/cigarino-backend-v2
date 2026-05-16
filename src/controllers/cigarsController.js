@@ -54,7 +54,9 @@ async function getCigar(req, res) {
         END as my_reaction
       FROM user_scans us
       JOIN users u ON us.user_id = u.id
-      WHERE us.cigar_id=$1 AND us.public_review IS NOT NULL AND us.public_review != ''
+      WHERE us.cigar_id=$1
+        AND us.public_review IS NOT NULL AND us.public_review != ''
+        AND ($2::int IS NULL OR us.user_id != $2)
       ORDER BY like_count DESC, u.reputation_score DESC, us.created_at DESC
       LIMIT 10
     `, [id, userId || null]);
