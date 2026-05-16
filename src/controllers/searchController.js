@@ -45,13 +45,13 @@ async function advancedSearch(req, res) {
   const havingParts = [];
 
   if (flavors?.length) {
-    havingParts.push(`array_agg(DISTINCT sf.flavor) @> $${idx}::text[]`);
+    havingParts.push(`array_agg(DISTINCT sf.flavor) FILTER (WHERE sf.flavor IS NOT NULL) @> $${idx}::text[]`);
     params.push(flavors);
     idx++;
   }
 
   if (moments?.length) {
-    havingParts.push(`array_agg(DISTINCT sm.moment) @> $${idx}::text[]`);
+    havingParts.push(`array_agg(DISTINCT sm.moment) FILTER (WHERE sm.moment IS NOT NULL) @> $${idx}::text[]`);
     params.push(moments);
     idx++;
   }
