@@ -75,14 +75,15 @@ async function getCave(req, res) {
 }
 
 async function addToCave(req, res) {
-  const { cigar_id, quantity = 1 } = req.body;
+  const { cigar_id, quantity = 1, price_paid } = req.body;
   try {
     await db.query(
-      `INSERT INTO user_cave (user_id, cigar_id, quantity)
-       VALUES ($1,$2,$3)
+      `INSERT INTO user_cave (user_id, cigar_id, quantity, price_paid)
+       VALUES ($1,$2,$3,$4)
        ON CONFLICT (user_id, cigar_id)
-       DO UPDATE SET quantity = user_cave.quantity + $3`,
-      [req.user.id, cigar_id, quantity]);
+       DO UPDATE SET quantity = user_cave.quantity + $3,
+         price_paid = COALESCE($4, user_cave.price_paid)`,
+      [req.user.id, cigar_id, quantity, price_paid||null]);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Erreur ajout cave' }); }
 }

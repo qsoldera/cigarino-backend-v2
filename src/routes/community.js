@@ -9,7 +9,7 @@ const {
   getNearbyGroups, getMyFollowees,
   getGroupPosts, createGroupPost,
   getGroupMessages, sendGroupMessage,
-  getGroupScans, updateMemberRole,
+  getGroupScans, updateMemberRole, togglePostLike,
 } = require('../controllers/communityController');
 
 const optAuth = async (req, res, next) => {
@@ -43,5 +43,6 @@ router.post('/groups/:group_id/messages', auth, sendGroupMessage);
 
 // Évaluations agrégées
 router.get('/groups/:group_id/scans', auth, getGroupScans);
+router.post('/groups/posts/:post_id/like', auth, togglePostLike);
 
 module.exports = router;

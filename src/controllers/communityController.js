@@ -417,22 +417,23 @@ async function getGroupScans(req, res) {
     if (!member.rows.length) return res.status(403).json({ error: 'Non membre' });
 
     const { rows } = await db.query(`
-      SELECT us.id, us.rating, us.public_review, us.created_at,
+      SELECT DISTINCT ON (us.id)
+        us.id, us.rating, us.public_review, us.created_at,
         u.username, u.avatar_url,
         c.id as cigar_id, b.name as brand, c.name as model,
         COALESCE(us.scan_image_url, c.admin_image_url, c.image_url) as image_url,
-        ROUND(AVG(us2.rating) OVER (PARTITION BY c.id)::numeric, 2) as group_avg
+        ROUND((
+          SELECT AVG(us2.rating) FROM user_scans us2
+          WHERE us2.cigar_id = c.id
+            AND us2.user_id IN (SELECT user_id FROM cigar_group_members WHERE group_id=$1)
+        )::numeric, 2) as group_avg
       FROM cigar_group_members gm
       JOIN users u ON gm.user_id = u.id
       JOIN user_scans us ON us.user_id = u.id
       JOIN cigars c ON us.cigar_id = c.id
       JOIN brands b ON c.brand_id = b.id
-      JOIN user_scans us2 ON us2.cigar_id = c.id
-        AND us2.user_id IN (
-          SELECT user_id FROM cigar_group_members WHERE group_id=$1
-        )
       WHERE gm.group_id = $1
-      ORDER BY us.created_at DESC
+      ORDER BY us.id, us.created_at DESC
       LIMIT 50
     `, [group_id]);
     res.json(rows);
@@ -465,6 +466,32 @@ async function updateMemberRole(req, res) {
   } catch (e) { res.status(500).json({ error: 'Erreur mise à jour rôle' }); }
 }
 
+
+async function togglePostLike(req, res) {
+  const { post_id } = req.params;
+  const userId = req.user.id;
+  try {
+    const existing = await db.query(
+      'SELECT id FROM post_likes WHERE post_id=$1 AND user_id=$2', [post_id, userId]);
+    let liked;
+    const post = await db.query('SELECT user_id FROM group_posts WHERE id=$1', [post_id]);
+    const authorId = post.rows[0]?.user_id;
+    if (existing.rows.length) {
+      await db.query('DELETE FROM post_likes WHERE post_id=$1 AND user_id=$2', [post_id, userId]);
+      liked = false;
+      if (authorId && authorId !== userId)
+        await db.query('UPDATE users SET reputation_score=GREATEST(0,reputation_score-0.01) WHERE id=$1 AND is_admin=FALSE', [authorId]);
+    } else {
+      await db.query('INSERT INTO post_likes (post_id, user_id) VALUES ($1,$2)', [post_id, userId]);
+      liked = true;
+      if (authorId && authorId !== userId)
+        await db.query('UPDATE users SET reputation_score=LEAST(1,reputation_score+0.01) WHERE id=$1 AND is_admin=FALSE', [authorId]);
+    }
+    const { rows } = await db.query('SELECT COUNT(*) as likes FROM post_likes WHERE post_id=$1', [post_id]);
+    res.json({ likes: parseInt(rows[0].likes), liked });
+  } catch (e) { res.status(500).json({ error: 'Erreur like post' }); }
+}
+
 module.exports = {
   searchUsers, getPublicProfile, toggleFollow, getFeed,
   leaderboardTopCigars, leaderboardTopTasters,
@@ -473,4 +500,5 @@ module.exports = {
   getGroupPosts, createGroupPost,
   getGroupMessages, sendGroupMessage,
   getGroupScans, updateMemberRole,
+  togglePostLike,
 };
