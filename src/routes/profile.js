@@ -14,11 +14,12 @@ const {
 router.get('/',         auth, getProfile);
 router.post('/avatar',  auth, ...uploadAvatar.single('avatar'), updateAvatar);
 
-router.get('/cave',                    auth, getCave);
-router.post('/cave',                   auth, addToCave);
+router.get('/cave',                        auth, getCave);
+router.post('/cave',                       auth, addToCave);
+// Routes spécifiques AVANT les routes paramétrées génériques
 router.delete('/cave/entry/:cave_entry_id', auth, removeFromCave);
-router.patch('/cave/:cigar_id/decrement',   auth, decrementCave);
 router.patch('/cave/entry/:cave_entry_id',  auth, updateCaveItem);
+router.patch('/cave/:cigar_id/decrement',   auth, decrementCave);
 
 router.get('/carnet',              auth, getCarnet);
 router.delete('/carnet/:scan_id',  auth, deleteScan);

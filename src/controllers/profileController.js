@@ -90,6 +90,7 @@ async function getCave(req, res) {
 
 async function addToCave(req, res) {
   const { cigar_id, quantity = 1, price_paid } = req.body;
+  console.log(`[addToCave] user=${req.user.id} cigar=${cigar_id} qty=${quantity} at=${new Date().toISOString()}`);
   // Utiliser une transaction avec advisory lock pour éviter les doublons
   const client = await db.connect();
   try {
