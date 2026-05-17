@@ -46,8 +46,8 @@ async function updateAvatar(req, res) {
 async function getCave(req, res) {
   const { sort = 'date' } = req.query;
   try {
-    // Agrégation cave dans sous-requête pour éviter la multiplication
-    // par les JOIN user_scans (N évaluations × 1 entrée cave = N lignes)
+    // Deux sous-requêtes séparées : cave + avg_rating
+    // Évite le problème GROUP BY sur json (non comparable en PostgreSQL)
     const { rows } = await db.query(`
       SELECT
         c.id          AS cigar_id,
@@ -58,34 +58,30 @@ async function getCave(req, res) {
         cave.total_quantity,
         cave.first_added_at,
         cave.entries,
-        COALESCE(ROUND(AVG(us.rating)::numeric, 2), 0) AS avg_rating
+        COALESCE(ratings.avg_rating, 0) AS avg_rating
       FROM (
         SELECT
           cigar_id,
-          SUM(quantity)::int                        AS total_quantity,
-          MIN(added_at)                              AS first_added_at,
+          SUM(quantity)::int AS total_quantity,
+          MIN(added_at)      AS first_added_at,
           json_agg(
-            json_build_object(
-              'id',       id,
-              'quantity', quantity,
-              'added_at', added_at
-            ) ORDER BY added_at ASC
-          )                                          AS entries
+            json_build_object('id', id, 'quantity', quantity, 'added_at', added_at)
+            ORDER BY added_at ASC
+          ) AS entries
         FROM user_cave
         WHERE user_id = $1
         GROUP BY cigar_id
       ) cave
       JOIN cigars c ON c.id = cave.cigar_id
       JOIN brands b ON c.brand_id = b.id
-      LEFT JOIN user_scans us ON us.cigar_id = c.id
-      GROUP BY
-        c.id, b.name, c.name,
-        c.admin_image_url, c.image_url,
-        c.admin_avg_price, c.avg_price,
-        cave.total_quantity, cave.first_added_at, cave.entries
+      LEFT JOIN (
+        SELECT cigar_id, ROUND(AVG(rating)::numeric, 2) AS avg_rating
+        FROM user_scans
+        GROUP BY cigar_id
+      ) ratings ON ratings.cigar_id = c.id
     `, [req.user.id]);
 
-    // Tri côté JS pour éviter les conflits ORDER BY / GROUP BY
+    // Tri côté JS
     const sortFn = {
       date:   (a, b) => new Date(b.first_added_at) - new Date(a.first_added_at),
       brand:  (a, b) => a.brand.localeCompare(b.brand),
@@ -96,7 +92,7 @@ async function getCave(req, res) {
     rows.sort(sortFn);
     res.json(rows);
   } catch (e) {
-    console.error('getCave:', e);
+    console.error('getCave:', e.message);
     res.status(500).json({ error: 'Erreur cave' });
   }
 }
