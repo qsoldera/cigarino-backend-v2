@@ -91,27 +91,31 @@ async function getCave(req, res) {
 async function addToCave(req, res) {
   const { cigar_id, quantity = 1, price_paid } = req.body;
   console.log(`[addToCave] user=${req.user.id} cigar=${cigar_id} qty=${quantity} at=${new Date().toISOString()}`);
-  // Utiliser une transaction avec advisory lock pour éviter les doublons
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    // Lock sur (user_id, cigar_id) pour éviter les inserts concurrents
     await client.query(
       'SELECT pg_advisory_xact_lock($1)',
       [parseInt(req.user.id) * 1000000 + parseInt(cigar_id)]);
 
+    // Chercher N'IMPORTE QUELLE entrée existante (pas seulement aujourd'hui)
+    // L'entrée par date distincte ne s'applique qu'aux entrées créées manuellement
+    // via le gestionnaire de stock, pas via le bouton "Ajouter à ma cave"
     const existing = await client.query(
       `SELECT id FROM user_cave
-       WHERE user_id=$1 AND cigar_id=$2 AND added_at::date = CURRENT_DATE`,
+       WHERE user_id=$1 AND cigar_id=$2
+       ORDER BY added_at DESC LIMIT 1`,
       [req.user.id, cigar_id]);
 
     if (existing.rows.length) {
+      // Incrémenter la dernière entrée existante
       await client.query(
         `UPDATE user_cave SET quantity = quantity + $1,
            price_paid = COALESCE($2, price_paid)
          WHERE id = $3`,
         [quantity, price_paid||null, existing.rows[0].id]);
     } else {
+      // Aucune entrée → créer la première
       await client.query(
         `INSERT INTO user_cave (user_id, cigar_id, quantity, price_paid)
          VALUES ($1,$2,$3,$4)`,

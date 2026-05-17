@@ -140,12 +140,13 @@ async function submitNewCigar(req, res) {
 
     // ── Destination ───────────────────────────────────────────────────────
     if (destination === 'cave') {
-      const caveToday = await client.query(
-        `SELECT id FROM user_cave WHERE user_id=$1 AND cigar_id=$2 AND added_at::date = CURRENT_DATE`,
+      const caveExisting = await client.query(
+        `SELECT id FROM user_cave WHERE user_id=$1 AND cigar_id=$2
+         ORDER BY added_at DESC LIMIT 1`,
         [userId, cigarId]);
-      if (caveToday.rows.length) {
+      if (caveExisting.rows.length) {
         await client.query('UPDATE user_cave SET quantity = quantity + 1 WHERE id=$1',
-          [caveToday.rows[0].id]);
+          [caveExisting.rows[0].id]);
       } else {
         await client.query('INSERT INTO user_cave (user_id, cigar_id, quantity) VALUES ($1,$2,1)',
           [userId, cigarId]);
