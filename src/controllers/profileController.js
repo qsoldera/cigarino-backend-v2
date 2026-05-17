@@ -76,16 +76,23 @@ async function getCave(req, res) {
 
 async function addToCave(req, res) {
   const { cigar_id, quantity = 1, price_paid } = req.body;
+  const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
   try {
+    // Si une entrée existe pour ce cigare AUJOURD'HUI → incrémenter
+    // Sinon → créer une nouvelle entrée (date distincte)
     await db.query(
-      `INSERT INTO user_cave (user_id, cigar_id, quantity, price_paid)
-       VALUES ($1,$2,$3,$4)
-       ON CONFLICT (user_id, cigar_id)
-       DO UPDATE SET quantity = user_cave.quantity + $3,
+      `INSERT INTO user_cave (user_id, cigar_id, quantity, price_paid, added_at)
+       VALUES ($1, $2, $3, $4, $5::date)
+       ON CONFLICT (user_id, cigar_id, (added_at::date))
+       DO UPDATE SET
+         quantity  = user_cave.quantity + $3,
          price_paid = COALESCE($4, user_cave.price_paid)`,
-      [req.user.id, cigar_id, quantity, price_paid||null]);
+      [req.user.id, cigar_id, quantity, price_paid||null, today]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: 'Erreur ajout cave' }); }
+  } catch (e) {
+    console.error('addToCave:', e);
+    res.status(500).json({ error: 'Erreur ajout cave' });
+  }
 }
 
 async function removeFromCave(req, res) {
@@ -100,21 +107,31 @@ async function decrementCave(req, res) {
   const client = await db.connect();
   try {
     await client.query('BEGIN');
+    // Décrémenter l'entrée la plus récente pour ce cigare
     const { rows } = await client.query(
       `UPDATE user_cave SET quantity = quantity - 1
-       WHERE user_id=$1 AND cigar_id=$2 RETURNING quantity`,
+       WHERE id = (
+         SELECT id FROM user_cave
+         WHERE user_id=$1 AND cigar_id=$2
+         ORDER BY added_at DESC LIMIT 1
+       )
+       RETURNING id, quantity`,
       [req.user.id, req.params.cigar_id]);
-    if (!rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Non trouvé' }); }
-    const qty = rows[0].quantity;
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      console.error('decrementCave: entrée introuvable pour user=%s cigar=%s',
+        req.user.id, req.params.cigar_id);
+      return res.status(404).json({ error: 'Non trouvé en cave' });
+    }
+    const { id, quantity: qty } = rows[0];
     if (qty <= 0) {
-      await client.query('DELETE FROM user_cave WHERE user_id=$1 AND cigar_id=$2',
-        [req.user.id, req.params.cigar_id]);
+      await client.query('DELETE FROM user_cave WHERE id=$1', [id]);
     }
     await client.query('COMMIT');
     res.json({ quantity: Math.max(0, qty), removed: qty <= 0 });
   } catch (e) {
     await client.query('ROLLBACK');
-    console.error('decrementCave:', e);
+    console.error('decrementCave error:', e);
     res.status(500).json({ error: 'Erreur décrémentation' });
   } finally { client.release(); }
 }
@@ -282,4 +299,67 @@ module.exports = {
   getCarnet, deleteScan,
   getFavorites,
   getWishlist, removeFromWishlist,
+  getStats,
 };
+
+// ── Statistiques détaillées ───────────────────────────────────────────────────
+async function getStats(req, res) {
+  const userId = req.user.id;
+  try {
+    const [flavorsRes, countriesRes, monthlyRes, strengthRes, momentsRes] = await Promise.all([
+      // Top saveurs
+      db.query(`
+        SELECT sf.flavor, COUNT(*) as count
+        FROM scan_flavors sf
+        JOIN user_scans us ON sf.scan_id = us.id
+        WHERE us.user_id = $1
+        GROUP BY sf.flavor ORDER BY count DESC LIMIT 8
+      `, [userId]),
+      // Pays dégustés
+      db.query(`
+        SELECT co.name as country, COUNT(*) as count
+        FROM user_scans us
+        JOIN cigars c ON us.cigar_id = c.id
+        JOIN countries co ON COALESCE(c.admin_country_id, c.country_id) = co.id
+        WHERE us.user_id = $1
+        GROUP BY co.name ORDER BY count DESC
+      `, [userId]),
+      // Dégustations par mois (12 derniers mois)
+      db.query(`
+        SELECT TO_CHAR(created_at, 'YYYY-MM') as month, COUNT(*) as count
+        FROM user_scans
+        WHERE user_id = $1
+          AND created_at > NOW() - INTERVAL '12 months'
+        GROUP BY month ORDER BY month
+      `, [userId]),
+      // Distribution des forces
+      db.query(`
+        SELECT COALESCE(c.admin_strength, c.strength) as strength, COUNT(*) as count
+        FROM user_scans us
+        JOIN cigars c ON us.cigar_id = c.id
+        WHERE us.user_id = $1
+          AND COALESCE(c.admin_strength, c.strength) IS NOT NULL
+        GROUP BY strength ORDER BY strength
+      `, [userId]),
+      // Moments préférés
+      db.query(`
+        SELECT sm.moment, COUNT(*) as count
+        FROM scan_moments sm
+        JOIN user_scans us ON sm.scan_id = us.id
+        WHERE us.user_id = $1
+        GROUP BY sm.moment ORDER BY count DESC LIMIT 5
+      `, [userId]),
+    ]);
+
+    res.json({
+      top_flavors:    flavorsRes.rows,
+      countries:      countriesRes.rows,
+      monthly:        monthlyRes.rows,
+      strength_dist:  strengthRes.rows,
+      top_moments:    momentsRes.rows,
+    });
+  } catch (e) {
+    console.error('getStats:', e);
+    res.status(500).json({ error: 'Erreur statistiques' });
+  }
+}

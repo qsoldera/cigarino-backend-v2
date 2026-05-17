@@ -85,10 +85,11 @@ async function submitNewCigar(req, res) {
       // Mise à jour image si absente
       if (imageUrl) {
         if (isAdmin) {
-          // L'admin écrase toujours l'image et valide
+          // Ne remplace que si aucune photo admin validée n'existe déjà
           await client.query(
             `UPDATE cigars
-             SET admin_image_url = $1, admin_verified = TRUE
+             SET admin_image_url = COALESCE(admin_image_url, $1),
+                 admin_verified = TRUE
              WHERE id = $2`,
             [imageUrl, cigarId]);
         } else {

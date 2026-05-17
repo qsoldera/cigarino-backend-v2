@@ -1,5 +1,5 @@
 const db = require('../config/database');
-const { notifyAdmins } = require('../utils/firebase');
+const { sendToUser, notifyAdmins } = require('../utils/firebase');
 
 // ── Fiche cigare ──────────────────────────────────────────────────────────────
 async function getCigar(req, res) {
@@ -187,21 +187,23 @@ async function submitScan(req, res) {
     await client.query('UPDATE cigars SET scan_count = scan_count + 1 WHERE id=$1', [cigar_id]);
     await client.query('DELETE FROM user_wishlist WHERE user_id=$1 AND cigar_id=$2', [userId, cigar_id]);
 
-    // Réputation : convergence saveurs
-    const countRes = await client.query('SELECT COUNT(*) FROM user_scans WHERE cigar_id=$1', [cigar_id]);
-    if (parseInt(countRes.rows[0].count) >= 3) {
-      const cf = await client.query(`
-        SELECT sf.flavor FROM scan_flavors sf JOIN user_scans us ON sf.scan_id=us.id
-        WHERE us.cigar_id=$1 AND us.id!=$2 GROUP BY sf.flavor ORDER BY COUNT(*) DESC LIMIT 10
-      `, [cigar_id, scanId]);
-      const communitySet = new Set(cf.rows.map(r => r.flavor));
-      const userFlavors = [...new Set([...(raw_flavors||[]), ...(mouth_flavors||[]), ...(nose_flavors||[])])];
-      const matches = userFlavors.filter(f => communitySet.has(f)).length;
-      if (matches > 0) {
-        const delta = Math.min(matches * 0.005, 1.0);
-        await client.query(
-          'UPDATE users SET reputation_score=LEAST(1.0, reputation_score+$1) WHERE id=$2 AND is_admin=FALSE',
-          [delta, userId]);
+    // Réputation : convergence saveurs (UNIQUEMENT si avis public)
+    if (public_review && public_review.trim().length > 0) {
+      const countRes = await client.query('SELECT COUNT(*) FROM user_scans WHERE cigar_id=$1', [cigar_id]);
+      if (parseInt(countRes.rows[0].count) >= 3) {
+        const cf = await client.query(`
+          SELECT sf.flavor FROM scan_flavors sf JOIN user_scans us ON sf.scan_id=us.id
+          WHERE us.cigar_id=$1 AND us.id!=$2 GROUP BY sf.flavor ORDER BY COUNT(*) DESC LIMIT 10
+        `, [cigar_id, scanId]);
+        const communitySet = new Set(cf.rows.map(r => r.flavor));
+        const userFlavors = [...new Set([...(raw_flavors||[]), ...(mouth_flavors||[]), ...(nose_flavors||[])])];
+        const matches = userFlavors.filter(f => communitySet.has(f)).length;
+        if (matches > 0) {
+          const delta = Math.min(matches * 0.005, 1.0);
+          await client.query(
+            'UPDATE users SET reputation_score=LEAST(1.0, reputation_score+$1) WHERE id=$2 AND is_admin=FALSE',
+            [delta, userId]);
+        }
       }
     }
 
@@ -327,6 +329,15 @@ async function toggleScanLike(req, res) {
       'SELECT COUNT(*) FILTER (WHERE is_like=TRUE) as likes FROM scan_likes WHERE scan_id=$1', [scan_id]);
 
     await client.query('COMMIT');
+
+    // Notification push si like (pas dislike)
+    if (is_like && authorId && authorId !== userId && delta > 0) {
+      const actor = await db.query('SELECT username FROM users WHERE id=$1', [userId]);
+      await sendToUser(db, authorId,
+        '👍 Nouveau like',
+        `${actor.rows[0]?.username || 'Un membre'} a aimé votre dégustation`);
+    }
+
     res.json({ likes: parseInt(counts[0].likes), my_reaction: is_like });
   } catch (e) {
     await client.query('ROLLBACK');

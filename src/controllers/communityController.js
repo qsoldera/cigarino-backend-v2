@@ -1,3 +1,4 @@
+const { sendToUser, notifyAdmins } = require('../utils/firebase');
 const db = require('../config/database');
 
 // ── Recherche utilisateurs ────────────────────────────────────────────────────
@@ -78,6 +79,11 @@ async function toggleFollow(req, res) {
     } else {
       await db.query('INSERT INTO user_follows (follower_id, following_id) VALUES ($1,$2)',
         [followerId, user_id]);
+      // Notification au membre suivi
+      const actor = await db.query('SELECT username FROM users WHERE id=$1', [followerId]);
+      await sendToUser(db, parseInt(user_id),
+        '👤 Nouvel abonné',
+        `${actor.rows[0]?.username || 'Un membre'} s'est abonné à votre profil`);
       res.json({ is_following: true });
     }
   } catch (e) { res.status(500).json({ error: 'Erreur follow' }); }

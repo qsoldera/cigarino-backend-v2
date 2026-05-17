@@ -8,6 +8,7 @@ const {
   getCarnet, deleteScan,
   getFavorites,
   getWishlist, removeFromWishlist,
+  getStats,
 } = require('../controllers/profileController');
 
 router.get('/',         auth, getProfile);
@@ -25,6 +26,7 @@ router.delete('/carnet/:scan_id',  auth, deleteScan);
 router.get('/favorites', auth, getFavorites);
 
 router.get('/wishlist',              auth, getWishlist);
+router.get('/stats',                  auth, getStats);
 router.delete('/wishlist/:cigar_id', auth, removeFromWishlist);
 
 module.exports = router;
