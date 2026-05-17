@@ -46,20 +46,31 @@ async function updateAvatar(req, res) {
 async function getCave(req, res) {
   const { sort = 'date' } = req.query;
   const order = {
-    date:   'uc.added_at DESC',
+    date:   'MIN(uc.added_at) DESC',
     brand:  'b.name ASC',
     rating: 'avg_rating DESC NULLS LAST',
     price:  'COALESCE(c.admin_avg_price,c.avg_price) ASC NULLS LAST',
-  }[sort] || 'uc.added_at DESC';
+  }[sort] || 'MIN(uc.added_at) DESC';
   try {
+    // Regrouper par cigare, agréger les entrées (dates distinctes)
     const { rows } = await db.query(`
-      SELECT uc.id, uc.quantity, uc.added_at,
+      SELECT
         c.id as cigar_id, b.name as brand, c.name as model,
         COALESCE(c.admin_image_url, c.image_url) as image_url,
         COALESCE(c.admin_avg_price, c.avg_price) as avg_price,
+        SUM(uc.quantity)::int as total_quantity,
+        MIN(uc.added_at) as first_added_at,
+        -- Tableau JSON des entrées distinctes pour la gestion de stock
+        json_agg(
+          json_build_object(
+            'id', uc.id,
+            'quantity', uc.quantity,
+            'added_at', uc.added_at
+          ) ORDER BY uc.added_at ASC
+        ) as entries,
         CASE WHEN SUM(u.reputation_score) > 0
-          THEN ROUND(SUM(us.rating * u.reputation_score)::numeric / SUM(u.reputation_score), 2)
-          ELSE COALESCE(ROUND(AVG(us.rating)::numeric, 2), 0)
+          THEN ROUND(SUM(DISTINCT us.rating * u.reputation_score)::numeric / NULLIF(SUM(DISTINCT u.reputation_score), 0), 2)
+          ELSE COALESCE(ROUND(AVG(DISTINCT us.rating)::numeric, 2), 0)
         END as avg_rating
       FROM user_cave uc
       JOIN cigars c ON uc.cigar_id = c.id
@@ -67,11 +78,14 @@ async function getCave(req, res) {
       LEFT JOIN user_scans us ON us.cigar_id = c.id
       LEFT JOIN users u ON us.user_id = u.id
       WHERE uc.user_id=$1
-      GROUP BY uc.id, c.id, b.name
+      GROUP BY c.id, b.name
       ORDER BY ${order}
     `, [req.user.id]);
     res.json(rows);
-  } catch (e) { res.status(500).json({ error: 'Erreur cave' }); }
+  } catch (e) {
+    console.error('getCave:', e);
+    res.status(500).json({ error: 'Erreur cave' });
+  }
 }
 
 async function addToCave(req, res) {
@@ -109,10 +123,25 @@ async function addToCave(req, res) {
 
 async function removeFromCave(req, res) {
   try {
-    await db.query('DELETE FROM user_cave WHERE user_id=$1 AND cigar_id=$2',
-      [req.user.id, req.params.cigar_id]);
+    // Utiliser l'id de la LIGNE (pas cigar_id) pour ne supprimer qu'une entrée
+    const { cave_entry_id } = req.params;
+    if (cave_entry_id) {
+      await db.query('DELETE FROM user_cave WHERE id=$1 AND user_id=$2',
+        [cave_entry_id, req.user.id]);
+    } else {
+      // Fallback legacy : supprimer l'entrée la plus ancienne
+      await db.query(
+        `DELETE FROM user_cave WHERE id = (
+          SELECT id FROM user_cave WHERE user_id=$1 AND cigar_id=$2
+          ORDER BY added_at ASC LIMIT 1
+        )`,
+        [req.user.id, req.params.cigar_id]);
+    }
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: 'Erreur suppression cave' }); }
+  } catch (e) {
+    console.error('removeFromCave:', e);
+    res.status(500).json({ error: 'Erreur suppression cave' });
+  }
 }
 
 async function decrementCave(req, res) {
@@ -186,11 +215,19 @@ async function updateCaveItem(req, res) {
 
   params.push(userId, cigarId);
   try {
-    const sql = `UPDATE user_cave SET ${sets.join(',')}
-                 WHERE user_id=$${idx} AND cigar_id=$${idx+1}
-                 RETURNING id, quantity, added_at`;
-    console.log('[updateCaveItem] SQL:', sql, params);
-    const result = await db.query(sql, params);
+    let sql, result;
+    if (entryId) {
+      params.push(userId, entryId);
+      sql = `UPDATE user_cave SET ${sets.join(',')}
+             WHERE user_id=$${idx} AND id=$${idx+1}
+             RETURNING id, quantity, added_at`;
+    } else {
+      params.push(userId, cigarId);
+      sql = `UPDATE user_cave SET ${sets.join(',')}
+             WHERE user_id=$${idx} AND cigar_id=$${idx+1}
+             RETURNING id, quantity, added_at`;
+    }
+    result = await db.query(sql, params);
     console.log('[updateCaveItem] rows updated:', result.rowCount, result.rows);
     if (result.rowCount === 0) {
       return res.status(404).json({ error: 'Entrée cave introuvable' });

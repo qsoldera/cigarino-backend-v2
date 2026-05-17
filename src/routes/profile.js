@@ -16,9 +16,9 @@ router.post('/avatar',  auth, ...uploadAvatar.single('avatar'), updateAvatar);
 
 router.get('/cave',                    auth, getCave);
 router.post('/cave',                   auth, addToCave);
-router.delete('/cave/:cigar_id',       auth, removeFromCave);
-router.patch('/cave/:cigar_id/decrement', auth, decrementCave);
-router.patch('/cave/:cigar_id',        auth, updateCaveItem);
+router.delete('/cave/entry/:cave_entry_id', auth, removeFromCave);
+router.patch('/cave/:cigar_id/decrement',   auth, decrementCave);
+router.patch('/cave/entry/:cave_entry_id',  auth, updateCaveItem);
 
 router.get('/carnet',              auth, getCarnet);
 router.delete('/carnet/:scan_id',  auth, deleteScan);
