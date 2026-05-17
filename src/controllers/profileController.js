@@ -90,27 +90,39 @@ async function getCave(req, res) {
 
 async function addToCave(req, res) {
   const { cigar_id, quantity = 1, price_paid } = req.body;
-  const today = new Date().toISOString().split('T')[0];
+  // Utiliser une transaction avec advisory lock pour éviter les doublons
+  const client = await db.connect();
   try {
-    const existing = await db.query(
-      `SELECT id FROM user_cave WHERE user_id=$1 AND cigar_id=$2 AND added_at::date = $3::date`,
-      [req.user.id, cigar_id, today]);
+    await client.query('BEGIN');
+    // Lock sur (user_id, cigar_id) pour éviter les inserts concurrents
+    await client.query(
+      'SELECT pg_advisory_xact_lock($1)',
+      [parseInt(req.user.id) * 1000000 + parseInt(cigar_id)]);
+
+    const existing = await client.query(
+      `SELECT id FROM user_cave
+       WHERE user_id=$1 AND cigar_id=$2 AND added_at::date = CURRENT_DATE`,
+      [req.user.id, cigar_id]);
+
     if (existing.rows.length) {
-      await db.query(
-        `UPDATE user_cave SET quantity = quantity + $1, price_paid = COALESCE($2, price_paid)
+      await client.query(
+        `UPDATE user_cave SET quantity = quantity + $1,
+           price_paid = COALESCE($2, price_paid)
          WHERE id = $3`,
         [quantity, price_paid||null, existing.rows[0].id]);
     } else {
-      await db.query(
-        `INSERT INTO user_cave (user_id, cigar_id, quantity, price_paid, added_at)
-         VALUES ($1,$2,$3,$4,$5::date)`,
-        [req.user.id, cigar_id, quantity, price_paid||null, today]);
+      await client.query(
+        `INSERT INTO user_cave (user_id, cigar_id, quantity, price_paid)
+         VALUES ($1,$2,$3,$4)`,
+        [req.user.id, cigar_id, quantity, price_paid||null]);
     }
+    await client.query('COMMIT');
     res.json({ success: true });
   } catch (e) {
+    await client.query('ROLLBACK');
     console.error('addToCave:', e.message);
     res.status(500).json({ error: 'Erreur ajout cave' });
-  }
+  } finally { client.release(); }
 }
 
 async function removeFromCave(req, res) {
