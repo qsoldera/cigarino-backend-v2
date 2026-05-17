@@ -532,8 +532,8 @@ module.exports = {
   leaderboardTopCigars, leaderboardTopTasters,
   getMyGroups, createGroup, getGroupMembers, joinGroup, leaveGroup,
   getNearbyGroups, getMyFollowees,
-  getGroupPosts, createGroupPost,
+  getGroupPosts, createGroupPost, deleteGroupPost,
   getGroupMessages, sendGroupMessage,
   getGroupScans, updateMemberRole,
-  togglePostLike,
+  togglePostLike, deleteGroup,
 };
