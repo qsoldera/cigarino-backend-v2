@@ -76,18 +76,30 @@ async function getCave(req, res) {
 
 async function addToCave(req, res) {
   const { cigar_id, quantity = 1, price_paid } = req.body;
-  const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+  const today = new Date().toISOString().split('T')[0];
   try {
-    // Si une entrée existe pour ce cigare AUJOURD'HUI → incrémenter
-    // Sinon → créer une nouvelle entrée (date distincte)
-    await db.query(
-      `INSERT INTO user_cave (user_id, cigar_id, quantity, price_paid, added_at)
-       VALUES ($1, $2, $3, $4, $5::date)
-       ON CONFLICT (user_id, cigar_id, (added_at::date))
-       DO UPDATE SET
-         quantity  = user_cave.quantity + $3,
-         price_paid = COALESCE($4, user_cave.price_paid)`,
-      [req.user.id, cigar_id, quantity, price_paid||null, today]);
+    // Chercher une entrée existante pour ce cigare AUJOURD'HUI
+    const existing = await db.query(
+      `SELECT id FROM user_cave
+       WHERE user_id=$1 AND cigar_id=$2
+         AND added_at::date = $3::date`,
+      [req.user.id, cigar_id, today]);
+
+    if (existing.rows.length) {
+      // Entrée du jour → incrémenter
+      await db.query(
+        `UPDATE user_cave
+         SET quantity  = quantity + $1,
+             price_paid = COALESCE($2, price_paid)
+         WHERE id = $3`,
+        [quantity, price_paid||null, existing.rows[0].id]);
+    } else {
+      // Nouvelle date → insérer
+      await db.query(
+        `INSERT INTO user_cave (user_id, cigar_id, quantity, price_paid, added_at)
+         VALUES ($1, $2, $3, $4, $5::date)`,
+        [req.user.id, cigar_id, quantity, price_paid||null, today]);
+    }
     res.json({ success: true });
   } catch (e) {
     console.error('addToCave:', e);
