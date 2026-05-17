@@ -58,28 +58,28 @@ async function getCave(req, res) {
         c.id as cigar_id, b.name as brand, c.name as model,
         COALESCE(c.admin_image_url, c.image_url) as image_url,
         COALESCE(c.admin_avg_price, c.avg_price) as avg_price,
-        SUM(uc.quantity)::int as total_quantity,
-        MIN(uc.added_at) as first_added_at,
-        -- Tableau JSON des entrées distinctes pour la gestion de stock
-        json_agg(
-          json_build_object(
-            'id', uc.id,
-            'quantity', uc.quantity,
-            'added_at', uc.added_at
-          ) ORDER BY uc.added_at ASC
-        ) as entries,
-        CASE WHEN SUM(u.reputation_score) > 0
-          THEN ROUND(SUM(DISTINCT us.rating * u.reputation_score)::numeric / NULLIF(SUM(DISTINCT u.reputation_score), 0), 2)
-          ELSE COALESCE(ROUND(AVG(DISTINCT us.rating)::numeric, 2), 0)
-        END as avg_rating
-      FROM user_cave uc
-      JOIN cigars c ON uc.cigar_id = c.id
+        cave.total_quantity,
+        cave.entries,
+        COALESCE(ROUND(AVG(us.rating)::numeric, 2), 0) as avg_rating
+      FROM (
+        -- Sous-requête isolée sur user_cave uniquement, sans JOIN user_scans
+        SELECT
+          cigar_id,
+          SUM(quantity)::int as total_quantity,
+          json_agg(
+            json_build_object('id', id, 'quantity', quantity, 'added_at', added_at)
+            ORDER BY added_at ASC
+          ) as entries,
+          MIN(added_at) as first_added_at
+        FROM user_cave
+        WHERE user_id=$1
+        GROUP BY cigar_id
+      ) cave
+      JOIN cigars c ON c.id = cave.cigar_id
       JOIN brands b ON c.brand_id = b.id
       LEFT JOIN user_scans us ON us.cigar_id = c.id
-      LEFT JOIN users u ON us.user_id = u.id
-      WHERE uc.user_id=$1
-      GROUP BY c.id, b.name
-      ORDER BY ${order}
+      GROUP BY c.id, b.name, cave.total_quantity, cave.entries, cave.first_added_at
+      ORDER BY ${order.replace('MIN(uc.added_at)', 'cave.first_added_at').replace('uc.', 'cave.')}
     `, [req.user.id]);
     res.json(rows);
   } catch (e) {
