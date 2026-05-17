@@ -118,29 +118,30 @@ async function quickSearch(req, res) {
   const { q } = req.query;
   if (!q || q.length < 2) return res.json([]);
 
-  const fp = fingerprint(q);
-  const pattern = `%${q}%`;
+  const pattern = `%${q.toLowerCase()}%`;
 
   try {
     const { rows } = await db.query(`
       SELECT c.id, b.name as brand, c.name as model,
         COALESCE(c.admin_image_url, c.image_url) as image_url,
-        -- Priorité : correspondance exacte > fingerprint > ILIKE
         CASE
-          WHEN LOWER(b.name || ' ' || c.name) LIKE LOWER($2) THEN 1
-          WHEN (b.name_normalized || c.name_normalized) LIKE '%' || $3 || '%' THEN 2
-          ELSE 3
+          WHEN LOWER(b.name || ' ' || c.name) LIKE $1 THEN 1
+          WHEN LOWER(b.name) LIKE $1 THEN 2
+          WHEN LOWER(c.name) LIKE $1 THEN 3
+          ELSE 4
         END as relevance
       FROM cigars c
       JOIN brands b ON c.brand_id = b.id
       WHERE
-        b.name ILIKE $2 OR c.name ILIKE $2
-        OR (b.name_normalized || c.name_normalized) LIKE '%' || $3 || '%'
+        LOWER(b.name) LIKE $1
+        OR LOWER(c.name) LIKE $1
+        OR LOWER(b.name || ' ' || c.name) LIKE $1
       ORDER BY relevance, c.scan_count DESC
-      LIMIT 10
-    `, [q, pattern, fp]);
+      LIMIT 15
+    `, [pattern]);
     res.json(rows);
   } catch (e) {
+    console.error('quickSearch error:', e);
     res.status(500).json({ error: 'Erreur recherche rapide' });
   }
 }

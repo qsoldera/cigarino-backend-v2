@@ -7,9 +7,10 @@ const {
   leaderboardTopCigars, leaderboardTopTasters,
   getMyGroups, createGroup, getGroupMembers, joinGroup, leaveGroup,
   getNearbyGroups, getMyFollowees,
-  getGroupPosts, createGroupPost,
+  getGroupPosts, createGroupPost, deleteGroupPost,
   getGroupMessages, sendGroupMessage,
   getGroupScans, updateMemberRole, togglePostLike,
+  deleteGroup,
 } = require('../controllers/communityController');
 
 const optAuth = async (req, res, next) => {
@@ -36,6 +37,8 @@ router.patch('/groups/:group_id/members/:user_id/role', auth, updateMemberRole);
 // Posts
 router.get('/groups/:group_id/posts',  auth, getGroupPosts);
 router.post('/groups/:group_id/posts', auth, ...uploadCigar.single('photo'), createGroupPost);
+router.delete('/groups/:group_id/posts/:post_id', auth, deleteGroupPost);
+router.delete('/groups/:group_id', auth, deleteGroup);
 
 // Messages
 router.get('/groups/:group_id/messages',  auth, getGroupMessages);

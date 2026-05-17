@@ -492,6 +492,41 @@ async function togglePostLike(req, res) {
   } catch (e) { res.status(500).json({ error: 'Erreur like post' }); }
 }
 
+
+// ── Supprimer un post (admin du club) ────────────────────────────────────────
+async function deleteGroupPost(req, res) {
+  const { group_id, post_id } = req.params;
+  const userId = req.user.id;
+  try {
+    // Vérifier admin du club OU auteur du post
+    const member = await db.query(
+      "SELECT role FROM cigar_group_members WHERE group_id=$1 AND user_id=$2",
+      [group_id, userId]);
+    const post = await db.query('SELECT user_id FROM group_posts WHERE id=$1', [post_id]);
+    if (!post.rows.length) return res.status(404).json({ error: 'Post introuvable' });
+    const isAdmin = member.rows.length && member.rows[0].role === 'admin';
+    const isAuthor = post.rows[0].user_id === userId;
+    if (!isAdmin && !isAuthor) return res.status(403).json({ error: 'Non autorisé' });
+    await db.query('DELETE FROM group_posts WHERE id=$1', [post_id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Erreur suppression post' }); }
+}
+
+// ── Supprimer un club (admin uniquement) ─────────────────────────────────────
+async function deleteGroup(req, res) {
+  const { group_id } = req.params;
+  const userId = req.user.id;
+  try {
+    const member = await db.query(
+      "SELECT role FROM cigar_group_members WHERE group_id=$1 AND user_id=$2",
+      [group_id, userId]);
+    if (!member.rows.length || member.rows[0].role !== 'admin')
+      return res.status(403).json({ error: 'Réservé à l'admin du club' });
+    await db.query('DELETE FROM cigar_groups WHERE id=$1', [group_id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Erreur suppression club' }); }
+}
+
 module.exports = {
   searchUsers, getPublicProfile, toggleFollow, getFeed,
   leaderboardTopCigars, leaderboardTopTasters,
