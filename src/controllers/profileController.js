@@ -307,47 +307,50 @@ async function getStats(req, res) {
   const userId = req.user.id;
   try {
     const [flavorsRes, countriesRes, monthlyRes, strengthRes, momentsRes] = await Promise.all([
-      // Top saveurs
+      // Top saveurs — ORDER BY 2 pour éviter ambiguïté avec alias "count"
       db.query(`
-        SELECT sf.flavor, COUNT(*) as count
+        SELECT sf.flavor, COUNT(*)::int as count
         FROM scan_flavors sf
         JOIN user_scans us ON sf.scan_id = us.id
         WHERE us.user_id = $1
-        GROUP BY sf.flavor ORDER BY count DESC LIMIT 8
+        GROUP BY sf.flavor
+        ORDER BY 2 DESC LIMIT 8
       `, [userId]),
       // Pays dégustés
       db.query(`
-        SELECT co.name as country, COUNT(*) as count
+        SELECT co.name as country, COUNT(*)::int as count
         FROM user_scans us
         JOIN cigars c ON us.cigar_id = c.id
-        JOIN countries co ON COALESCE(c.admin_country_id, c.country_id) = co.id
-        WHERE us.user_id = $1
-        GROUP BY co.name ORDER BY count DESC
+        LEFT JOIN countries co ON COALESCE(c.admin_country_id, c.country_id) = co.id
+        WHERE us.user_id = $1 AND co.name IS NOT NULL
+        GROUP BY co.name
+        ORDER BY 2 DESC
       `, [userId]),
       // Dégustations par mois (12 derniers mois)
       db.query(`
-        SELECT TO_CHAR(created_at, 'YYYY-MM') as month, COUNT(*) as count
+        SELECT TO_CHAR(created_at, 'YYYY-MM') as month, COUNT(*)::int as count
         FROM user_scans
         WHERE user_id = $1
           AND created_at > NOW() - INTERVAL '12 months'
-        GROUP BY month ORDER BY month
+        GROUP BY 1 ORDER BY 1
       `, [userId]),
       // Distribution des forces
       db.query(`
-        SELECT COALESCE(c.admin_strength, c.strength) as strength, COUNT(*) as count
+        SELECT COALESCE(c.admin_strength, c.strength)::int as strength, COUNT(*)::int as count
         FROM user_scans us
         JOIN cigars c ON us.cigar_id = c.id
         WHERE us.user_id = $1
           AND COALESCE(c.admin_strength, c.strength) IS NOT NULL
-        GROUP BY strength ORDER BY strength
+        GROUP BY 1 ORDER BY 1
       `, [userId]),
       // Moments préférés
       db.query(`
-        SELECT sm.moment, COUNT(*) as count
+        SELECT sm.moment, COUNT(*)::int as count
         FROM scan_moments sm
         JOIN user_scans us ON sm.scan_id = us.id
         WHERE us.user_id = $1
-        GROUP BY sm.moment ORDER BY count DESC LIMIT 5
+        GROUP BY sm.moment
+        ORDER BY 2 DESC LIMIT 5
       `, [userId]),
     ]);
 
