@@ -140,10 +140,16 @@ async function submitNewCigar(req, res) {
 
     // ── Destination ───────────────────────────────────────────────────────
     if (destination === 'cave') {
-      await client.query(
-        `INSERT INTO user_cave (user_id, cigar_id, quantity) VALUES ($1,$2,1)
-         ON CONFLICT (user_id, cigar_id) DO UPDATE SET quantity = user_cave.quantity + 1`,
+      const caveToday = await client.query(
+        `SELECT id FROM user_cave WHERE user_id=$1 AND cigar_id=$2 AND added_at::date = CURRENT_DATE`,
         [userId, cigarId]);
+      if (caveToday.rows.length) {
+        await client.query('UPDATE user_cave SET quantity = quantity + 1 WHERE id=$1',
+          [caveToday.rows[0].id]);
+      } else {
+        await client.query('INSERT INTO user_cave (user_id, cigar_id, quantity) VALUES ($1,$2,1)',
+          [userId, cigarId]);
+      }
     } else if (destination === 'wishlist') {
       await client.query(
         'INSERT INTO user_wishlist (user_id, cigar_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
