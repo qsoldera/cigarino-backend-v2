@@ -92,55 +92,39 @@ async function addToCave(req, res) {
   const { cigar_id, quantity = 1, price_paid } = req.body;
   const today = new Date().toISOString().split('T')[0];
   try {
-    // Chercher une entrée existante pour ce cigare AUJOURD'HUI
     const existing = await db.query(
-      `SELECT id FROM user_cave
-       WHERE user_id=$1 AND cigar_id=$2
-         AND added_at::date = $3::date`,
+      `SELECT id FROM user_cave WHERE user_id=$1 AND cigar_id=$2 AND added_at::date = $3::date`,
       [req.user.id, cigar_id, today]);
-
     if (existing.rows.length) {
-      // Entrée du jour → incrémenter
       await db.query(
-        `UPDATE user_cave
-         SET quantity  = quantity + $1,
-             price_paid = COALESCE($2, price_paid)
+        `UPDATE user_cave SET quantity = quantity + $1, price_paid = COALESCE($2, price_paid)
          WHERE id = $3`,
         [quantity, price_paid||null, existing.rows[0].id]);
     } else {
-      // Nouvelle date → insérer
       await db.query(
         `INSERT INTO user_cave (user_id, cigar_id, quantity, price_paid, added_at)
-         VALUES ($1, $2, $3, $4, $5::date)`,
+         VALUES ($1,$2,$3,$4,$5::date)`,
         [req.user.id, cigar_id, quantity, price_paid||null, today]);
     }
     res.json({ success: true });
   } catch (e) {
-    console.error('addToCave:', e);
+    console.error('addToCave:', e.message);
     res.status(500).json({ error: 'Erreur ajout cave' });
   }
 }
 
 async function removeFromCave(req, res) {
+  const { cave_entry_id } = req.params;
   try {
-    // Utiliser l'id de la LIGNE (pas cigar_id) pour ne supprimer qu'une entrée
-    const { cave_entry_id } = req.params;
-    if (cave_entry_id) {
-      await db.query('DELETE FROM user_cave WHERE id=$1 AND user_id=$2',
-        [cave_entry_id, req.user.id]);
-    } else {
-      // Fallback legacy : supprimer l'entrée la plus ancienne
-      await db.query(
-        `DELETE FROM user_cave WHERE id = (
-          SELECT id FROM user_cave WHERE user_id=$1 AND cigar_id=$2
-          ORDER BY added_at ASC LIMIT 1
-        )`,
-        [req.user.id, req.params.cigar_id]);
-    }
+    const result = await db.query(
+      'DELETE FROM user_cave WHERE id=$1 AND user_id=$2 RETURNING id',
+      [cave_entry_id, req.user.id]);
+    if (result.rowCount === 0)
+      return res.status(404).json({ error: 'Entrée introuvable' });
     res.json({ success: true });
   } catch (e) {
-    console.error('removeFromCave:', e);
-    res.status(500).json({ error: 'Erreur suppression cave' });
+    console.error('removeFromCave:', e.message);
+    res.status(500).json({ error: 'Erreur suppression' });
   }
 }
 
@@ -148,98 +132,66 @@ async function decrementCave(req, res) {
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    // Décrémenter l'entrée la plus récente pour ce cigare
     const { rows } = await client.query(
       `UPDATE user_cave SET quantity = quantity - 1
        WHERE id = (
-         SELECT id FROM user_cave
-         WHERE user_id=$1 AND cigar_id=$2
+         SELECT id FROM user_cave WHERE user_id=$1 AND cigar_id=$2
          ORDER BY added_at DESC LIMIT 1
-       )
-       RETURNING id, quantity`,
+       ) RETURNING id, quantity`,
       [req.user.id, req.params.cigar_id]);
     if (!rows.length) {
       await client.query('ROLLBACK');
-      console.error('decrementCave: entrée introuvable pour user=%s cigar=%s',
-        req.user.id, req.params.cigar_id);
       return res.status(404).json({ error: 'Non trouvé en cave' });
     }
     const { id, quantity: qty } = rows[0];
-    if (qty <= 0) {
-      await client.query('DELETE FROM user_cave WHERE id=$1', [id]);
-    }
+    if (qty <= 0) await client.query('DELETE FROM user_cave WHERE id=$1', [id]);
     await client.query('COMMIT');
     res.json({ quantity: Math.max(0, qty), removed: qty <= 0 });
   } catch (e) {
     await client.query('ROLLBACK');
-    console.error('decrementCave error:', e);
+    console.error('decrementCave:', e.message);
     res.status(500).json({ error: 'Erreur décrémentation' });
   } finally { client.release(); }
 }
 
 async function updateCaveItem(req, res) {
+  const entryId = req.params.cave_entry_id;
   const userId  = req.user.id;
-  const cigarId = req.params.cigar_id;
-  const rawQty  = req.body.quantity;
-  const added_at = req.body.added_at;
+  const qty     = req.body.quantity !== undefined ? Number(req.body.quantity) : undefined;
+  const addedAt = req.body.added_at;
 
-  console.log('[updateCaveItem] body:', req.body, 'user:', userId, 'cigar:', cigarId);
+  console.log('[updateCaveItem] entryId:', entryId, 'qty:', qty, 'addedAt:', addedAt);
 
-  const qty = rawQty !== undefined ? Number(rawQty) : undefined;
-
-  // Supprimer si quantité = 0
-  if (qty !== undefined && (isNaN(qty) || qty <= 0)) {
-    try {
-      await db.query('DELETE FROM user_cave WHERE user_id=$1 AND cigar_id=$2', [userId, cigarId]);
-      return res.json({ removed: true });
-    } catch (e) {
-      console.error('[updateCaveItem] delete error:', e);
-      return res.status(500).json({ error: 'Erreur suppression' });
-    }
+  if (qty !== undefined && qty <= 0) {
+    await db.query('DELETE FROM user_cave WHERE id=$1 AND user_id=$2', [entryId, userId]);
+    return res.json({ removed: true });
   }
 
-  const sets   = [];
-  const params = [];
-  let   idx    = 1;
-
-  if (qty !== undefined && !isNaN(qty)) {
-    sets.push(`quantity=$${idx++}`);
-    params.push(Math.round(qty));
+  const sets = [], params = [];
+  let idx = 1;
+  if (qty !== undefined && !isNaN(qty) && qty > 0) {
+    sets.push(`quantity=$${idx++}`); params.push(Math.round(qty));
   }
-  if (added_at !== undefined && added_at !== null) {
-    sets.push(`added_at=$${idx++}`);
-    params.push(new Date(added_at));
+  if (addedAt) {
+    sets.push(`added_at=$${idx++}`); params.push(new Date(addedAt));
   }
-
   if (!sets.length) return res.status(400).json({ error: 'Rien à modifier' });
 
-  params.push(userId, cigarId);
+  params.push(userId, entryId);
   try {
-    let sql, result;
-    if (entryId) {
-      params.push(userId, entryId);
-      sql = `UPDATE user_cave SET ${sets.join(',')}
-             WHERE user_id=$${idx} AND id=$${idx+1}
-             RETURNING id, quantity, added_at`;
-    } else {
-      params.push(userId, cigarId);
-      sql = `UPDATE user_cave SET ${sets.join(',')}
-             WHERE user_id=$${idx} AND cigar_id=$${idx+1}
-             RETURNING id, quantity, added_at`;
-    }
-    result = await db.query(sql, params);
-    console.log('[updateCaveItem] rows updated:', result.rowCount, result.rows);
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Entrée cave introuvable' });
-    }
-    res.json({ success: true, row: result.rows[0] });
+    const { rowCount, rows } = await db.query(
+      `UPDATE user_cave SET ${sets.join(',')}
+       WHERE user_id=$${idx} AND id=$${idx+1} RETURNING id, quantity`,
+      params);
+    if (rowCount === 0) return res.status(404).json({ error: 'Entrée introuvable' });
+    res.json({ success: true, row: rows[0] });
   } catch (e) {
-    console.error('[updateCaveItem] error:', e);
+    console.error('updateCaveItem error:', e.message);
     res.status(500).json({ error: 'Erreur mise à jour cave' });
   }
 }
 
-// ── Carnet ────────────────────────────────────────────────────────────────────
+
 async function getCarnet(req, res) {
   const { sort = 'date' } = req.query;
   const order = {
