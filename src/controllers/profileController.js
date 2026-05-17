@@ -45,42 +45,55 @@ async function updateAvatar(req, res) {
 // ── Cave ──────────────────────────────────────────────────────────────────────
 async function getCave(req, res) {
   const { sort = 'date' } = req.query;
-  const order = {
-    date:   'MIN(uc.added_at) DESC',
-    brand:  'b.name ASC',
-    rating: 'avg_rating DESC NULLS LAST',
-    price:  'COALESCE(c.admin_avg_price,c.avg_price) ASC NULLS LAST',
-  }[sort] || 'MIN(uc.added_at) DESC';
   try {
-    // Regrouper par cigare, agréger les entrées (dates distinctes)
+    // Agrégation cave dans sous-requête pour éviter la multiplication
+    // par les JOIN user_scans (N évaluations × 1 entrée cave = N lignes)
     const { rows } = await db.query(`
       SELECT
-        c.id as cigar_id, b.name as brand, c.name as model,
-        COALESCE(c.admin_image_url, c.image_url) as image_url,
-        COALESCE(c.admin_avg_price, c.avg_price) as avg_price,
+        c.id          AS cigar_id,
+        b.name        AS brand,
+        c.name        AS model,
+        COALESCE(c.admin_image_url, c.image_url) AS image_url,
+        COALESCE(c.admin_avg_price, c.avg_price) AS avg_price,
         cave.total_quantity,
+        cave.first_added_at,
         cave.entries,
-        COALESCE(ROUND(AVG(us.rating)::numeric, 2), 0) as avg_rating
+        COALESCE(ROUND(AVG(us.rating)::numeric, 2), 0) AS avg_rating
       FROM (
-        -- Sous-requête isolée sur user_cave uniquement, sans JOIN user_scans
         SELECT
           cigar_id,
-          SUM(quantity)::int as total_quantity,
+          SUM(quantity)::int                        AS total_quantity,
+          MIN(added_at)                              AS first_added_at,
           json_agg(
-            json_build_object('id', id, 'quantity', quantity, 'added_at', added_at)
-            ORDER BY added_at ASC
-          ) as entries,
-          MIN(added_at) as first_added_at
+            json_build_object(
+              'id',       id,
+              'quantity', quantity,
+              'added_at', added_at
+            ) ORDER BY added_at ASC
+          )                                          AS entries
         FROM user_cave
-        WHERE user_id=$1
+        WHERE user_id = $1
         GROUP BY cigar_id
       ) cave
       JOIN cigars c ON c.id = cave.cigar_id
       JOIN brands b ON c.brand_id = b.id
       LEFT JOIN user_scans us ON us.cigar_id = c.id
-      GROUP BY c.id, b.name, cave.total_quantity, cave.entries, cave.first_added_at
-      ORDER BY ${order.replace('MIN(uc.added_at)', 'cave.first_added_at').replace('uc.', 'cave.')}
+      GROUP BY
+        c.id, b.name, c.name,
+        c.admin_image_url, c.image_url,
+        c.admin_avg_price, c.avg_price,
+        cave.total_quantity, cave.first_added_at, cave.entries
     `, [req.user.id]);
+
+    // Tri côté JS pour éviter les conflits ORDER BY / GROUP BY
+    const sortFn = {
+      date:   (a, b) => new Date(b.first_added_at) - new Date(a.first_added_at),
+      brand:  (a, b) => a.brand.localeCompare(b.brand),
+      rating: (a, b) => (b.avg_rating || 0) - (a.avg_rating || 0),
+      price:  (a, b) => (a.avg_price || 999) - (b.avg_price || 999),
+    }[sort] || ((a, b) => new Date(b.first_added_at) - new Date(a.first_added_at));
+
+    rows.sort(sortFn);
     res.json(rows);
   } catch (e) {
     console.error('getCave:', e);
