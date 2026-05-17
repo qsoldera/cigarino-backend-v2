@@ -521,7 +521,7 @@ async function deleteGroup(req, res) {
       "SELECT role FROM cigar_group_members WHERE group_id=$1 AND user_id=$2",
       [group_id, userId]);
     if (!member.rows.length || member.rows[0].role !== 'admin')
-      return res.status(403).json({ error: 'Réservé à l'admin du club' });
+      return res.status(403).json({ error: "Réservé à l'admin du club" });
     await db.query('DELETE FROM cigar_groups WHERE id=$1', [group_id]);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Erreur suppression club' }); }
