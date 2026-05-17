@@ -28,7 +28,7 @@ async function register(req, res) {
     const hash = await bcrypt.hash(password, 12);
     const { rows } = await db.query(
       `INSERT INTO users (username, email, password_hash, reputation_score)
-       VALUES ($1, $2, $3, 0.5) RETURNING id, username, email, is_admin, reputation_score, avatar_url, created_at`,
+       VALUES ($1, $2, $3, 0.01) RETURNING id, username, email, is_admin, reputation_score, avatar_url, created_at`,
       [username, email.toLowerCase(), hash]
     );
 
