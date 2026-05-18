@@ -21,12 +21,12 @@ async function register(req, res) {
       [email.toLowerCase(), username]
     );
     if (exists.rows.length) {
-      const taken = exists.rows[0];
       return res.status(409).json({ error: "Email ou nom d'utilisateur déjà utilisé" });
     }
 
     const hash = await bcrypt.hash(password, 12);
     const { rows } = await db.query(
+      // FIX v2.0.1 : score de départ 0.01 (1%) au lieu de 0.5 (50%)
       `INSERT INTO users (username, email, password_hash, reputation_score)
        VALUES ($1, $2, $3, 0.01) RETURNING id, username, email, is_admin, reputation_score, avatar_url, created_at`,
       [username, email.toLowerCase(), hash]
@@ -42,20 +42,25 @@ async function register(req, res) {
 }
 
 async function login(req, res) {
+  // FIX v2.0.1 : le champ s'appelle "email" dans la requête Flutter
+  // mais accepte désormais email OU nom d'utilisateur
   const { email, password } = req.body;
   if (!email || !password)
     return res.status(400).json({ error: 'Champs requis manquants' });
 
   try {
+    // Recherche par email (insensible à la casse) OU par username (exact)
     const { rows } = await db.query(
-      'SELECT * FROM users WHERE email = $1',
-      [email.toLowerCase()]
+      'SELECT * FROM users WHERE LOWER(email) = LOWER($1) OR username = $1',
+      [email.trim()]
     );
-    if (!rows.length) return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
+    if (!rows.length)
+      return res.status(401).json({ error: 'Identifiant ou mot de passe incorrect' });
 
     const user = rows[0];
     const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
+    if (!valid)
+      return res.status(401).json({ error: 'Identifiant ou mot de passe incorrect' });
 
     const token = generateToken(user.id);
     const { password_hash, ...safeUser } = user;

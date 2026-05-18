@@ -46,8 +46,6 @@ async function updateAvatar(req, res) {
 async function getCave(req, res) {
   const { sort = 'date' } = req.query;
   try {
-    // Deux sous-requêtes séparées : cave + avg_rating
-    // Évite le problème GROUP BY sur json (non comparable en PostgreSQL)
     const { rows } = await db.query(`
       SELECT
         c.id          AS cigar_id,
@@ -81,7 +79,6 @@ async function getCave(req, res) {
       ) ratings ON ratings.cigar_id = c.id
     `, [req.user.id]);
 
-    // Tri côté JS
     const sortFn = {
       date:   (a, b) => new Date(b.first_added_at) - new Date(a.first_added_at),
       brand:  (a, b) => a.brand.localeCompare(b.brand),
@@ -107,9 +104,6 @@ async function addToCave(req, res) {
       'SELECT pg_advisory_xact_lock($1)',
       [parseInt(req.user.id) * 1000000 + parseInt(cigar_id)]);
 
-    // Chercher N'IMPORTE QUELLE entrée existante (pas seulement aujourd'hui)
-    // L'entrée par date distincte ne s'applique qu'aux entrées créées manuellement
-    // via le gestionnaire de stock, pas via le bouton "Ajouter à ma cave"
     const existing = await client.query(
       `SELECT id FROM user_cave
        WHERE user_id=$1 AND cigar_id=$2
@@ -117,14 +111,12 @@ async function addToCave(req, res) {
       [req.user.id, cigar_id]);
 
     if (existing.rows.length) {
-      // Incrémenter la dernière entrée existante
       await client.query(
         `UPDATE user_cave SET quantity = quantity + $1,
            price_paid = COALESCE($2, price_paid)
          WHERE id = $3`,
         [quantity, price_paid||null, existing.rows[0].id]);
     } else {
-      // Aucune entrée → créer la première
       await client.query(
         `INSERT INTO user_cave (user_id, cigar_id, quantity, price_paid)
          VALUES ($1,$2,$3,$4)`,
@@ -217,7 +209,9 @@ async function updateCaveItem(req, res) {
   }
 }
 
-
+// FIX v2.0.1 : scan_image_url en priorité 1 dans le COALESCE
+// Avant : COALESCE(c.admin_image_url, c.image_url) → affichait la photo de la fiche
+// Après : COALESCE(us.scan_image_url, c.admin_image_url, c.image_url) → photo de dégustation en premier
 async function getCarnet(req, res) {
   const { sort = 'date' } = req.query;
   const order = {
@@ -230,8 +224,9 @@ async function getCarnet(req, res) {
       SELECT us.id, us.rating, us.created_at, us.public_review, us.finish_note,
         us.intensity, us.complexity, us.draw, us.duration, us.pairing,
         us.ash_color, us.smoke_consistency,
+        us.scan_image_url,
         c.id as cigar_id, b.name as brand, c.name as model,
-        COALESCE(c.admin_image_url, c.image_url) as image_url,
+        COALESCE(us.scan_image_url, c.admin_image_url, c.image_url) as image_url,
         array_agg(DISTINCT sf.flavor) FILTER (WHERE sf.flavor IS NOT NULL) as flavors,
         array_agg(DISTINCT sm.moment) FILTER (WHERE sm.moment IS NOT NULL) as moments
       FROM user_scans us
@@ -320,21 +315,11 @@ async function removeFromWishlist(req, res) {
   } catch (e) { res.status(500).json({ error: 'Erreur suppression wishlist' }); }
 }
 
-module.exports = {
-  getProfile, updateAvatar,
-  getCave, addToCave, removeFromCave, decrementCave, updateCaveItem,
-  getCarnet, deleteScan,
-  getFavorites,
-  getWishlist, removeFromWishlist,
-  getStats,
-};
-
 // ── Statistiques détaillées ───────────────────────────────────────────────────
 async function getStats(req, res) {
   const userId = req.user.id;
   try {
     const [flavorsRes, countriesRes, monthlyRes, strengthRes, momentsRes] = await Promise.all([
-      // Top saveurs — ORDER BY 2 pour éviter ambiguïté avec alias "count"
       db.query(`
         SELECT sf.flavor, COUNT(*)::int as count
         FROM scan_flavors sf
@@ -343,7 +328,6 @@ async function getStats(req, res) {
         GROUP BY sf.flavor
         ORDER BY 2 DESC LIMIT 8
       `, [userId]),
-      // Pays dégustés
       db.query(`
         SELECT co.name as country, COUNT(*)::int as count
         FROM user_scans us
@@ -353,7 +337,6 @@ async function getStats(req, res) {
         GROUP BY co.name
         ORDER BY 2 DESC
       `, [userId]),
-      // Dégustations par mois (12 derniers mois)
       db.query(`
         SELECT TO_CHAR(created_at, 'YYYY-MM') as month, COUNT(*)::int as count
         FROM user_scans
@@ -361,7 +344,6 @@ async function getStats(req, res) {
           AND created_at > NOW() - INTERVAL '12 months'
         GROUP BY 1 ORDER BY 1
       `, [userId]),
-      // Distribution des forces
       db.query(`
         SELECT COALESCE(c.admin_strength, c.strength)::int as strength, COUNT(*)::int as count
         FROM user_scans us
@@ -370,7 +352,6 @@ async function getStats(req, res) {
           AND COALESCE(c.admin_strength, c.strength) IS NOT NULL
         GROUP BY 1 ORDER BY 1
       `, [userId]),
-      // Moments préférés
       db.query(`
         SELECT sm.moment, COUNT(*)::int as count
         FROM scan_moments sm
@@ -393,3 +374,12 @@ async function getStats(req, res) {
     res.status(500).json({ error: 'Erreur statistiques' });
   }
 }
+
+module.exports = {
+  getProfile, updateAvatar,
+  getCave, addToCave, removeFromCave, decrementCave, updateCaveItem,
+  getCarnet, deleteScan,
+  getFavorites,
+  getWishlist, removeFromWishlist,
+  getStats,
+};
