@@ -1,5 +1,9 @@
 const db = require('../config/database');
 
+// FIX v2.0.2 : durées unifiées avec constants.dart côté Flutter
+// Liste unique : '<30min', '30-60min', '60-90min', '>90min'
+const DURATION_ORDER = ['<30min', '30-60min', '60-90min', '>90min'];
+
 async function advancedSearch(req, res) {
   const {
     countries, flavors, moments,
@@ -41,7 +45,6 @@ async function advancedSearch(req, res) {
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
-  // HAVING : filtre saveurs + moments + durée max
   const havingParts = [];
 
   if (flavors?.length) {
@@ -57,12 +60,10 @@ async function advancedSearch(req, res) {
   }
 
   if (duration_max) {
-    // '<30min' | '30-60min' | '60-90min' | '>90min'
-    // On filtre en excluant les durées au-delà du max choisi
-    const durationOrder = ['<30min', '30-60min', '60-90min', '>90min'];
-    const maxIdx = durationOrder.indexOf(duration_max);
+    // FIX v2.0.2 : utilise la liste unifiée DURATION_ORDER
+    const maxIdx = DURATION_ORDER.indexOf(duration_max);
     if (maxIdx !== -1) {
-      const allowed = durationOrder.slice(0, maxIdx + 1);
+      const allowed = DURATION_ORDER.slice(0, maxIdx + 1);
       havingParts.push(`(mode() WITHIN GROUP (ORDER BY us.duration) IS NULL OR mode() WITHIN GROUP (ORDER BY us.duration) = ANY($${idx}::text[]))`);
       params.push(allowed);
       idx++;
@@ -84,7 +85,6 @@ async function advancedSearch(req, res) {
           ELSE COALESCE(ROUND(AVG(us.rating)::numeric, 2), 0)
         END as avg_rating,
         COUNT(DISTINCT us.id) as rating_count,
-        -- Score Bayésien
         CASE WHEN COUNT(DISTINCT us.id) > 0
           THEN (
             CASE WHEN SUM(u.reputation_score) > 0

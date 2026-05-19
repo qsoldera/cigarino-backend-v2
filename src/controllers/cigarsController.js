@@ -1,6 +1,9 @@
 const db = require('../config/database');
 const { sendToUser, notifyAdmins } = require('../utils/firebase');
 
+// Moments valides — doit correspondre à AppConstants.moments côté Flutter
+const VALID_MOMENTS = ['Après-repas', 'Apéritif', 'Célébration', 'Détente', 'Travail', 'Plein air'];
+
 // ── Fiche cigare ──────────────────────────────────────────────────────────────
 async function getCigar(req, res) {
   const { id } = req.params;
@@ -42,9 +45,20 @@ async function getCigar(req, res) {
     const { rows: pairingsRows } = await db.query(
       'SELECT pairing, SUM(u.reputation_score) as weight FROM user_scans us JOIN users u ON us.user_id=u.id WHERE us.cigar_id=$1 AND pairing IS NOT NULL GROUP BY pairing ORDER BY weight DESC LIMIT 4',
       [id]);
+
+    // FIX v2.0.2 : filtre sur les moments valides pour éviter l'affichage de
+    // caractères parasites ('i', 'P', 'a', 'e'…) issus d'anciennes insertions incorrectes
     const { rows: momentsRows } = await db.query(
-      'SELECT moment, SUM(u.reputation_score) as weight FROM scan_moments sm JOIN user_scans us ON sm.scan_id=us.id JOIN users u ON us.user_id=u.id WHERE us.cigar_id=$1 GROUP BY moment ORDER BY weight DESC LIMIT 4',
-      [id]);
+      `SELECT moment, SUM(u.reputation_score) as weight
+       FROM scan_moments sm
+       JOIN user_scans us ON sm.scan_id = us.id
+       JOIN users u ON us.user_id = u.id
+       WHERE us.cigar_id = $1
+         AND sm.moment = ANY($2::text[])
+       GROUP BY moment
+       ORDER BY weight DESC LIMIT 4`,
+      [id, VALID_MOMENTS]);
+
     const { rows: reviewsRows } = await db.query(`
       SELECT us.id, us.rating, us.public_review, us.created_at,
         u.username, u.reputation_score, u.avatar_url,
@@ -74,14 +88,14 @@ async function getCigar(req, res) {
             array_agg(DISTINCT sf.flavor) FILTER (WHERE sf.flavor IS NOT NULL AND sf.category='raw') as raw_flavors,
             array_agg(DISTINCT sf.flavor) FILTER (WHERE sf.flavor IS NOT NULL AND sf.category='mouth') as mouth_flavors,
             array_agg(DISTINCT sf.flavor) FILTER (WHERE sf.flavor IS NOT NULL AND sf.category='nose') as nose_flavors,
-            array_agg(DISTINCT sm.moment) FILTER (WHERE sm.moment IS NOT NULL) as moments
+            array_agg(DISTINCT sm.moment) FILTER (WHERE sm.moment IS NOT NULL AND sm.moment = ANY($3::text[])) as moments
           FROM user_scans us
           LEFT JOIN scan_flavors sf ON sf.scan_id = us.id
           LEFT JOIN scan_moments sm ON sm.scan_id = us.id
           WHERE us.user_id=$1 AND us.cigar_id=$2
           GROUP BY us.id
           ORDER BY us.created_at DESC
-        `, [userId, id]),
+        `, [userId, id, VALID_MOMENTS]),
       ]);
       personalData = {
         is_favorite: !!favRes.rows.length,
@@ -116,7 +130,7 @@ async function toggleFavorite(req, res) {
       await db.query('INSERT INTO user_favorites (user_id, cigar_id) VALUES ($1,$2)', [req.user.id, id]);
       res.json({ is_favorite: true });
     }
-  } catch (e) { res.status(500).json({ error: 'Erreur favori' }); }
+  } catch (e) { res.status(500).json({ error: 'Erreur favoris' }); }
 }
 
 async function toggleWishlist(req, res) {
@@ -136,74 +150,91 @@ async function toggleWishlist(req, res) {
 async function reportCigar(req, res) {
   const { id } = req.params;
   const { reason, detail } = req.body;
-  const VALID = ['doublon','erreur_identification','mauvaise_photo','infos_incorrectes','cigare_inexistant','autre'];
-  if (!VALID.includes(reason)) return res.status(400).json({ error: 'Motif invalide' });
+  if (!reason) return res.status(400).json({ error: 'Motif requis' });
   try {
+    const existing = await db.query(
+      "SELECT id FROM reports WHERE cigar_id=$1 AND reported_by=$2 AND status='pending'",
+      [id, req.user.id]);
+    if (existing.rows.length)
+      return res.status(409).json({ error: 'Vous avez déjà signalé ce cigare' });
+
     await db.query(
-      "INSERT INTO reports (cigar_id, reported_by, reason, detail, status) VALUES ($1,$2,$3,$4,'pending')",
-      [id, req.user.id, reason, detail||null]);
-    const r = await db.query('SELECT c.name, b.name as brand FROM cigars c JOIN brands b ON c.brand_id=b.id WHERE c.id=$1', [id]);
-    await notifyAdmins(db, '🚨 Nouveau signalement', `${r.rows[0]?.brand} ${r.rows[0]?.name} — ${reason}`);
+      'INSERT INTO reports (cigar_id, reported_by, reason, detail) VALUES ($1,$2,$3,$4)',
+      [id, req.user.id, reason, detail || null]);
+
+    await notifyAdmins(db, '🚩 Nouveau signalement', `${req.user.username} a signalé un cigare`);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Erreur signalement' }); }
 }
 
 async function submitScan(req, res) {
-  const { cigar_id, rating, intensity, complexity, draw, duration,
-    raw_flavors, mouth_flavors, nose_flavors, finish_note, ash_color,
-    smoke_consistency, pairing, moments, private_notes, public_review } = req.body;
-  const userId = req.user.id;
-  const scanImageUrl = req.file?.path || null;
+  const {
+    cigar_id, rating, intensity, complexity, draw,
+    duration, raw_flavors, mouth_flavors, nose_flavors,
+    finish_note, ash_color, smoke_consistency, pairing, moments,
+    private_notes, public_review,
+  } = req.body;
 
-  if (!cigar_id || !rating) return res.status(400).json({ error: 'cigar_id et rating requis' });
+  if (!cigar_id) return res.status(400).json({ error: 'cigar_id requis' });
+
+  // FIX v2.0.2 : validation stricte du rating côté backend
+  const ratingNum = Number(rating);
+  if (!rating || isNaN(ratingNum) || ratingNum < 1 || ratingNum > 5) {
+    return res.status(400).json({ error: 'La note est requise et doit être comprise entre 1 et 5' });
+  }
+
+  const imageUrl = req.file?.path || null;
 
   const client = await db.connect();
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `INSERT INTO user_scans (user_id, cigar_id, rating, intensity, complexity, draw,
-        duration, finish_note, ash_color, smoke_consistency, pairing,
-        private_notes, public_review, scan_image_url)
+      `INSERT INTO user_scans
+        (user_id, cigar_id, rating, intensity, complexity, draw,
+         duration, finish_note, ash_color, smoke_consistency,
+         pairing, private_notes, public_review, scan_image_url)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        RETURNING id`,
-      [userId, cigar_id, rating, intensity||null, complexity||null, draw||null,
-       duration||null, finish_note||null, ash_color||null,
-       smoke_consistency||null, pairing||null,
-       private_notes||null, public_review||null, scanImageUrl]);
+      [req.user.id, cigar_id, ratingNum,
+       intensity || null, complexity || null, draw || null,
+       duration || null, finish_note || null, ash_color || null, smoke_consistency || null,
+       pairing || null, private_notes || null, public_review || null, imageUrl]);
+
     const scanId = rows[0].id;
 
     const allFlavors = [
-      ...(raw_flavors||[]).map(f => ({flavor:f, category:'raw'})),
-      ...(mouth_flavors||[]).map(f => ({flavor:f, category:'mouth'})),
-      ...(nose_flavors||[]).map(f => ({flavor:f, category:'nose'})),
+      ...((raw_flavors || []).map(f => [scanId, f, 'raw'])),
+      ...((mouth_flavors || []).map(f => [scanId, f, 'mouth'])),
+      ...((nose_flavors || []).map(f => [scanId, f, 'nose'])),
     ];
-    for (const {flavor, category} of allFlavors) {
-      await client.query('INSERT INTO scan_flavors (scan_id, flavor, category) VALUES ($1,$2,$3)', [scanId, flavor, category]);
-    }
-    for (const moment of (moments||[])) {
-      await client.query('INSERT INTO scan_moments (scan_id, moment) VALUES ($1,$2)', [scanId, moment]);
+    for (const [sid, flavor, cat] of allFlavors) {
+      await client.query(
+        'INSERT INTO scan_flavors (scan_id, flavor, category) VALUES ($1,$2,$3)',
+        [sid, flavor, cat]);
     }
 
-    await client.query('UPDATE cigars SET scan_count = scan_count + 1 WHERE id=$1', [cigar_id]);
-    await client.query('DELETE FROM user_wishlist WHERE user_id=$1 AND cigar_id=$2', [userId, cigar_id]);
+    // FIX v2.0.2 : n'insère que les moments valides pour éviter les caractères parasites
+    for (const moment of (moments || [])) {
+      if (VALID_MOMENTS.includes(moment)) {
+        await client.query('INSERT INTO scan_moments (scan_id, moment) VALUES ($1,$2)', [scanId, moment]);
+      }
+    }
 
-    // Réputation : convergence saveurs (UNIQUEMENT si avis public)
-    if (public_review && public_review.trim().length > 0) {
-      const countRes = await client.query('SELECT COUNT(*) FROM user_scans WHERE cigar_id=$1', [cigar_id]);
-      if (parseInt(countRes.rows[0].count) >= 3) {
-        const cf = await client.query(`
-          SELECT sf.flavor FROM scan_flavors sf JOIN user_scans us ON sf.scan_id=us.id
-          WHERE us.cigar_id=$1 AND us.id!=$2 GROUP BY sf.flavor ORDER BY COUNT(*) DESC LIMIT 10
-        `, [cigar_id, scanId]);
-        const communitySet = new Set(cf.rows.map(r => r.flavor));
-        const userFlavors = [...new Set([...(raw_flavors||[]), ...(mouth_flavors||[]), ...(nose_flavors||[])])];
-        const matches = userFlavors.filter(f => communitySet.has(f)).length;
-        if (matches > 0) {
-          const delta = Math.min(matches * 0.005, 1.0);
-          await client.query(
-            'UPDATE users SET reputation_score=LEAST(1.0, reputation_score+$1) WHERE id=$2 AND is_admin=FALSE',
-            [delta, userId]);
-        }
+    await client.query(
+      'UPDATE cigars SET scan_count = scan_count + 1 WHERE id=$1', [cigar_id]);
+
+    // Réputation : convergence de saveurs
+    const allFlavNames = [...(raw_flavors||[]), ...(mouth_flavors||[]), ...(nose_flavors||[])];
+    if (allFlavNames.length > 0 && public_review) {
+      const { rows: communityFlavs } = await client.query(
+        'SELECT flavor FROM scan_flavors sf JOIN user_scans us ON sf.scan_id=us.id WHERE us.cigar_id=$1',
+        [cigar_id]);
+      const communitySet = new Set(communityFlavs.map(r => r.flavor));
+      const matches = allFlavNames.filter(f => communitySet.has(f)).length;
+      if (matches > 0) {
+        await client.query(
+          'UPDATE users SET reputation_score = LEAST(1.0, reputation_score + $1) WHERE id=$2',
+          [matches * 0.005, req.user.id]);
       }
     }
 
@@ -218,40 +249,73 @@ async function submitScan(req, res) {
 
 async function updateScan(req, res) {
   const { scan_id } = req.params;
-  const userId = req.user.id;
-  const { rating, intensity, complexity, draw, duration, raw_flavors, mouth_flavors, nose_flavors,
-    finish_note, ash_color, smoke_consistency, pairing, moments, private_notes, public_review } = req.body;
-  const scanImageUrl = req.file?.path || null;
+  const {
+    rating, intensity, complexity, draw,
+    duration, raw_flavors, mouth_flavors, nose_flavors,
+    finish_note, ash_color, smoke_consistency, pairing, moments,
+    private_notes, public_review,
+  } = req.body;
 
+  // FIX v2.0.2 : validation rating dans updateScan également
+  if (rating !== undefined) {
+    const ratingNum = Number(rating);
+    if (isNaN(ratingNum) || ratingNum < 1 || ratingNum > 5) {
+      return res.status(400).json({ error: 'La note doit être comprise entre 1 et 5' });
+    }
+  }
+
+  const imageUrl = req.file?.path || null;
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    const check = await client.query('SELECT id FROM user_scans WHERE id=$1 AND user_id=$2', [scan_id, userId]);
-    if (!check.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Dégustation introuvable' }); }
+    const sets = [], params = [];
+    let idx = 1;
+    const addField = (col, val) => { if (val !== undefined) { sets.push(`${col}=$${idx++}`); params.push(val ?? null); }};
 
-    await client.query(
-      `UPDATE user_scans SET
-        rating=$1, intensity=$2, complexity=$3, draw=$4, duration=$5,
-        finish_note=$6, ash_color=$7, smoke_consistency=$8, pairing=$9,
-        private_notes=$10, public_review=$11,
-        scan_image_url=COALESCE($12, scan_image_url)
-       WHERE id=$13`,
-      [rating, intensity||null, complexity||null, draw||null, duration||null,
-       finish_note||null, ash_color||null, smoke_consistency||null, pairing||null,
-       private_notes||null, public_review||null, scanImageUrl, scan_id]);
+    addField('rating',           rating !== undefined ? Number(rating) : undefined);
+    addField('intensity',        intensity);
+    addField('complexity',       complexity);
+    addField('draw',             draw);
+    addField('duration',         duration);
+    addField('finish_note',      finish_note);
+    addField('ash_color',        ash_color);
+    addField('smoke_consistency',smoke_consistency);
+    addField('pairing',          pairing);
+    addField('private_notes',    private_notes);
+    addField('public_review',    public_review);
+    if (imageUrl) { sets.push(`scan_image_url=$${idx++}`); params.push(imageUrl); }
 
-    await client.query('DELETE FROM scan_flavors WHERE scan_id=$1', [scan_id]);
-    const allFlavors = [
-      ...(raw_flavors||[]).map(f => ({flavor:f,category:'raw'})),
-      ...(mouth_flavors||[]).map(f => ({flavor:f,category:'mouth'})),
-      ...(nose_flavors||[]).map(f => ({flavor:f,category:'nose'})),
-    ];
-    for (const {flavor,category} of allFlavors) {
-      await client.query('INSERT INTO scan_flavors (scan_id, flavor, category) VALUES ($1,$2,$3)', [scan_id, flavor, category]);
+    if (sets.length) {
+      params.push(req.user.id, scan_id);
+      const { rowCount } = await client.query(
+        `UPDATE user_scans SET ${sets.join(',')} WHERE user_id=$${idx} AND id=$${idx+1}`,
+        params);
+      if (rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Scan introuvable' });
+      }
     }
-    await client.query('DELETE FROM scan_moments WHERE scan_id=$1', [scan_id]);
-    for (const moment of (moments||[])) {
-      await client.query('INSERT INTO scan_moments (scan_id, moment) VALUES ($1,$2)', [scan_id, moment]);
+
+    if (raw_flavors !== undefined || mouth_flavors !== undefined || nose_flavors !== undefined) {
+      await client.query('DELETE FROM scan_flavors WHERE scan_id=$1', [scan_id]);
+      const allFlavors = [
+        ...((raw_flavors||[]).map(f => [scan_id, f, 'raw'])),
+        ...((mouth_flavors||[]).map(f => [scan_id, f, 'mouth'])),
+        ...((nose_flavors||[]).map(f => [scan_id, f, 'nose'])),
+      ];
+      for (const [sid, flavor, cat] of allFlavors) {
+        await client.query('INSERT INTO scan_flavors (scan_id, flavor, category) VALUES ($1,$2,$3)', [sid, flavor, cat]);
+      }
+    }
+
+    if (moments !== undefined) {
+      await client.query('DELETE FROM scan_moments WHERE scan_id=$1', [scan_id]);
+      // FIX v2.0.2 : validation moments dans updateScan
+      for (const moment of moments) {
+        if (VALID_MOMENTS.includes(moment)) {
+          await client.query('INSERT INTO scan_moments (scan_id, moment) VALUES ($1,$2)', [scan_id, moment]);
+        }
+      }
     }
 
     await client.query('COMMIT');
@@ -259,86 +323,80 @@ async function updateScan(req, res) {
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('updateScan:', e);
-    res.status(500).json({ error: 'Erreur mise à jour dégustation' });
+    res.status(500).json({ error: 'Erreur mise à jour scan' });
   } finally { client.release(); }
 }
 
 async function addUserPhoto(req, res) {
-  if (!req.file) return res.status(400).json({ error: 'Photo requise' });
   const { id } = req.params;
+  if (!req.file) return res.status(400).json({ error: 'Photo requise' });
   try {
-    if (req.user.is_admin) {
-      await db.query('UPDATE cigars SET admin_image_url=$1, admin_verified=TRUE WHERE id=$2', [req.file.path, id]);
-    } else {
-      await db.query('UPDATE cigars SET image_url=$1 WHERE id=$2 AND admin_image_url IS NULL', [req.file.path, id]);
-    }
-    res.json({ image_url: req.file.path, success: true });
-  } catch (e) { res.status(500).json({ error: 'Erreur upload photo' }); }
+    await db.query('UPDATE cigars SET image_url=$1 WHERE id=$2', [req.file.path, id]);
+    res.json({ image_url: req.file.path });
+  } catch (e) { res.status(500).json({ error: 'Erreur photo' }); }
 }
 
 async function addScanPhoto(req, res) {
-  if (!req.file) return res.status(400).json({ error: 'Photo requise' });
   const { scan_id } = req.params;
+  if (!req.file) return res.status(400).json({ error: 'Photo requise' });
   try {
-    await db.query('UPDATE user_scans SET scan_image_url=$1 WHERE id=$2 AND user_id=$3', [req.file.path, scan_id, req.user.id]);
+    const { rowCount } = await db.query(
+      'UPDATE user_scans SET scan_image_url=$1 WHERE id=$2 AND user_id=$3',
+      [req.file.path, scan_id, req.user.id]);
+    if (rowCount === 0) return res.status(404).json({ error: 'Scan introuvable' });
     res.json({ scan_image_url: req.file.path });
-  } catch (e) { res.status(500).json({ error: 'Erreur upload photo scan' }); }
+  } catch (e) { res.status(500).json({ error: 'Erreur photo scan' }); }
 }
 
-// ── Likes/dislikes évaluations ─────────────────────────────────────────────
 async function toggleScanLike(req, res) {
   const { scan_id } = req.params;
-  const { is_like } = req.body; // true=like, false=dislike
-  const userId = req.user.id;
+  const { is_like } = req.body;
+  if (is_like === undefined) return res.status(400).json({ error: 'is_like requis' });
 
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    // Chercher réaction existante
     const existing = await client.query(
-      'SELECT id, is_like FROM scan_likes WHERE scan_id=$1 AND user_id=$2', [scan_id, userId]);
+      'SELECT is_like FROM scan_likes WHERE scan_id=$1 AND user_id=$2',
+      [scan_id, req.user.id]);
+
+    const scan = await client.query(
+      'SELECT user_id FROM user_scans WHERE id=$1', [scan_id]);
+    if (!scan.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Scan introuvable' });
+    }
+    const scanOwnerId = scan.rows[0].user_id;
 
     let delta = 0;
-    const scan = await client.query('SELECT user_id FROM user_scans WHERE id=$1', [scan_id]);
-    const authorId = scan.rows[0]?.user_id;
-
     if (existing.rows.length) {
-      const wasLike = existing.rows[0].is_like;
-      if (wasLike === is_like) {
-        // Retirer la réaction
-        await client.query('DELETE FROM scan_likes WHERE scan_id=$1 AND user_id=$2', [scan_id, userId]);
-        delta = wasLike ? -0.01 : +0.005; // annuler l'effet
+      const oldLike = existing.rows[0].is_like;
+      if (oldLike === is_like) {
+        await client.query('DELETE FROM scan_likes WHERE scan_id=$1 AND user_id=$2', [scan_id, req.user.id]);
+        delta = is_like ? -0.01 : 0.005;
       } else {
-        // Changer de réaction
-        await client.query('UPDATE scan_likes SET is_like=$1 WHERE scan_id=$2 AND user_id=$3', [is_like, scan_id, userId]);
-        delta = is_like ? +0.015 : -0.015; // +like −dislike ou inverse
+        await client.query('UPDATE scan_likes SET is_like=$1 WHERE scan_id=$2 AND user_id=$3', [is_like, scan_id, req.user.id]);
+        delta = is_like ? 0.015 : -0.015;
       }
     } else {
-      await client.query('INSERT INTO scan_likes (scan_id, user_id, is_like) VALUES ($1,$2,$3)', [scan_id, userId, is_like]);
-      delta = is_like ? +0.01 : -0.005;
+      await client.query('INSERT INTO scan_likes (scan_id, user_id, is_like) VALUES ($1,$2,$3)', [scan_id, req.user.id, is_like]);
+      delta = is_like ? 0.01 : -0.005;
+      if (is_like && scanOwnerId !== req.user.id) {
+        await sendToUser(db, scanOwnerId, '👍 Nouveau j\'aime', `${req.user.username} a aimé votre dégustation`);
+      }
     }
 
-    if (authorId && authorId !== userId && delta !== 0) {
+    if (delta !== 0 && scanOwnerId !== req.user.id) {
       await client.query(
-        'UPDATE users SET reputation_score=GREATEST(0.0,LEAST(1.0,reputation_score+$1)) WHERE id=$2 AND is_admin=FALSE',
-        [delta, authorId]);
+        'UPDATE users SET reputation_score = LEAST(1.0, GREATEST(0.0, reputation_score + $1)) WHERE id=$2 AND is_admin=FALSE',
+        [delta, scanOwnerId]);
     }
 
-    // Compter les likes (publics)
-    const { rows: counts } = await client.query(
-      'SELECT COUNT(*) FILTER (WHERE is_like=TRUE) as likes FROM scan_likes WHERE scan_id=$1', [scan_id]);
+    const { rows: countRows } = await client.query(
+      'SELECT COUNT(*) FROM scan_likes WHERE scan_id=$1 AND is_like=TRUE', [scan_id]);
 
     await client.query('COMMIT');
-
-    // Notification push si like (pas dislike)
-    if (is_like && authorId && authorId !== userId && delta > 0) {
-      const actor = await db.query('SELECT username FROM users WHERE id=$1', [userId]);
-      await sendToUser(db, authorId,
-        '👍 Nouveau like',
-        `${actor.rows[0]?.username || 'Un membre'} a aimé votre dégustation`);
-    }
-
-    res.json({ likes: parseInt(counts[0].likes), my_reaction: is_like });
+    res.json({ likes: parseInt(countRows[0].count) });
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('toggleScanLike:', e);
