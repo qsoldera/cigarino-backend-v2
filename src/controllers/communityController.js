@@ -532,6 +532,46 @@ async function deleteGroup(req, res) {
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Erreur suppression club' }); }
 }
+async function inviteMember(req, res) {
+  const { group_id } = req.params;
+  const { user_id }  = req.body;
+  const requesterId  = req.user.id;
+
+  if (!user_id) return res.status(400).json({ error: 'user_id requis' });
+
+  try {
+    // Vérifier que le demandeur est admin du groupe
+    const requester = await db.query(
+      "SELECT role FROM cigar_group_members WHERE group_id=$1 AND user_id=$2",
+      [group_id, requesterId]);
+    if (!requester.rows.length || requester.rows[0].role !== 'admin')
+      return res.status(403).json({ error: 'Réservé aux admins du groupe' });
+
+    // Vérifier que l'utilisateur invité existe
+    const target = await db.query('SELECT id, username FROM users WHERE id=$1', [user_id]);
+    if (!target.rows.length) return res.status(404).json({ error: 'Utilisateur introuvable' });
+
+    // Ajouter le membre (ON CONFLICT DO NOTHING si déjà membre)
+    const result = await db.query(
+      `INSERT INTO cigar_group_members (group_id, user_id, role)
+       VALUES ($1, $2, 'member')
+       ON CONFLICT (group_id, user_id) DO NOTHING
+       RETURNING id`,
+      [group_id, user_id]);
+
+    if (result.rowCount === 0) {
+      return res.status(409).json({ error: 'Cet utilisateur est déjà membre du groupe' });
+    }
+
+    res.status(201).json({
+      success: true,
+      message: `${target.rows[0].username} a été ajouté au groupe`,
+    });
+  } catch (e) {
+    console.error('inviteMember:', e);
+    res.status(500).json({ error: "Erreur lors de l'invitation" });
+  }
+}
 
 module.exports = {
   searchUsers, getPublicProfile, toggleFollow, getFeed,
@@ -542,4 +582,5 @@ module.exports = {
   getGroupMessages, sendGroupMessage,
   getGroupScans, updateMemberRole,
   togglePostLike, deleteGroup,
+  inviteMember,
 };

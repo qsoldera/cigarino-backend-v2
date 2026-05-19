@@ -1,12 +1,10 @@
 const db = require('../config/database');
 
-// FIX v2.0.2 : durées unifiées avec constants.dart côté Flutter
-// Liste unique : '<30min', '30-60min', '60-90min', '>90min'
 const DURATION_ORDER = ['<30min', '30-60min', '60-90min', '>90min'];
 
 async function advancedSearch(req, res) {
   const {
-    countries, flavors, moments,
+    countries, flavors, moments, pairings,
     strength_value, strength_mode,
     price_min, price_max,
     duration_max,
@@ -18,55 +16,54 @@ async function advancedSearch(req, res) {
 
   if (countries?.length) {
     conditions.push(`co.name = ANY($${idx})`);
-    params.push(countries);
-    idx++;
+    params.push(countries); idx++;
   }
-
   if (strength_value && strength_mode) {
     const ops = { 'exact': '=', 'gte': '>=', 'lte': '<=' };
     const op = ops[strength_mode] || '=';
     conditions.push(`COALESCE(c.admin_strength, c.strength) ${op} $${idx}`);
-    params.push(strength_value);
-    idx++;
+    params.push(strength_value); idx++;
   }
-
-  if (price_min !== undefined && price_min !== null) {
+  if (price_min != null) {
     conditions.push(`COALESCE(c.admin_avg_price, c.avg_price) >= $${idx}`);
-    params.push(price_min);
-    idx++;
+    params.push(price_min); idx++;
   }
-
-  if (price_max !== undefined && price_max !== null) {
+  if (price_max != null) {
     const maxVal = price_max >= 100 ? 999999 : price_max;
     conditions.push(`COALESCE(c.admin_avg_price, c.avg_price) <= $${idx}`);
-    params.push(maxVal);
-    idx++;
+    params.push(maxVal); idx++;
   }
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-
   const havingParts = [];
 
   if (flavors?.length) {
-    havingParts.push(`array_agg(DISTINCT sf.flavor::text) FILTER (WHERE sf.flavor IS NOT NULL) @> $${idx}::text[]`);
-    params.push(flavors);
-    idx++;
+    havingParts.push(
+      `array_agg(DISTINCT sf.flavor::text) FILTER (WHERE sf.flavor IS NOT NULL) @> $${idx}::text[]`
+    );
+    params.push(flavors); idx++;
   }
-
   if (moments?.length) {
-    havingParts.push(`array_agg(DISTINCT sm.moment::text) FILTER (WHERE sm.moment IS NOT NULL) @> $${idx}::text[]`);
-    params.push(moments);
-    idx++;
+    havingParts.push(
+      `array_agg(DISTINCT sm.moment::text) FILTER (WHERE sm.moment IS NOT NULL) @> $${idx}::text[]`
+    );
+    params.push(moments); idx++;
   }
-
+  // FIX v2.0.3 : filtre accords boisson
+  if (pairings?.length) {
+    havingParts.push(
+      `array_agg(DISTINCT us.pairing::text) FILTER (WHERE us.pairing IS NOT NULL) && $${idx}::text[]`
+    );
+    params.push(pairings); idx++;
+  }
   if (duration_max) {
-    // FIX v2.0.2 : utilise la liste unifiée DURATION_ORDER
     const maxIdx = DURATION_ORDER.indexOf(duration_max);
     if (maxIdx !== -1) {
       const allowed = DURATION_ORDER.slice(0, maxIdx + 1);
-      havingParts.push(`(mode() WITHIN GROUP (ORDER BY us.duration) IS NULL OR mode() WITHIN GROUP (ORDER BY us.duration) = ANY($${idx}::text[]))`);
-      params.push(allowed);
-      idx++;
+      havingParts.push(
+        `(mode() WITHIN GROUP (ORDER BY us.duration) IS NULL OR mode() WITHIN GROUP (ORDER BY us.duration) = ANY($${idx}::text[]))`
+      );
+      params.push(allowed); idx++;
     }
   }
 

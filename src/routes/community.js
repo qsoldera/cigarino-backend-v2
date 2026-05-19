@@ -11,6 +11,7 @@ const {
   getGroupMessages, sendGroupMessage,
   getGroupScans, updateMemberRole, togglePostLike,
   deleteGroup,
+  inviteMember,
 } = require('../controllers/communityController');
 
 const optAuth = async (req, res, next) => {
@@ -31,6 +32,7 @@ router.post('/groups',                 auth, createGroup);
 router.get('/groups/nearby',           auth, getNearbyGroups);
 router.get('/groups/:group_id/members',       auth, getGroupMembers);
 router.post('/groups/:group_id/join',         auth, joinGroup);
+router.post('/groups/:group_id/members', auth, inviteMember);
 router.delete('/groups/:group_id/leave',      auth, leaveGroup);
 router.patch('/groups/:group_id/members/:user_id/role', auth, updateMemberRole);
 
