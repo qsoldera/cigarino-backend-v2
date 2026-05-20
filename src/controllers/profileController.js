@@ -42,6 +42,26 @@ async function updateAvatar(req, res) {
   } catch (e) { res.status(500).json({ error: 'Erreur avatar' }); }
 }
 
+// FIX v2.0.5 : bio utilisateur éditable
+async function updateProfile(req, res) {
+  const { bio } = req.body;
+  if (bio === undefined)
+    return res.status(400).json({ error: 'Aucun champ à mettre à jour' });
+
+  const bioTrimmed = bio === null ? null : String(bio).slice(0, 300).trim();
+  try {
+    const { rows } = await db.query(
+      `UPDATE users SET bio=$1 WHERE id=$2
+       RETURNING id, username, email, avatar_url, bio, reputation_score, is_admin, created_at`,
+      [bioTrimmed, req.user.id]
+    );
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('updateProfile:', e);
+    res.status(500).json({ error: 'Erreur mise à jour profil' });
+  }
+}
+
 // ── Cave ──────────────────────────────────────────────────────────────────────
 async function getCave(req, res) {
   const { sort = 'date' } = req.query;
@@ -95,8 +115,8 @@ async function getCave(req, res) {
 }
 
 async function addToCave(req, res) {
-  const { cigar_id, quantity = 1, price_paid } = req.body;
-  console.log(`[addToCave] user=${req.user.id} cigar=${cigar_id} qty=${quantity} at=${new Date().toISOString()}`);
+  // FIX v2.0.4 : price_paid retiré de l'INSERT (colonne inexistante dans le schéma initial)
+  const { cigar_id, quantity = 1 } = req.body;
   const client = await db.connect();
   try {
     await client.query('BEGIN');
@@ -105,22 +125,17 @@ async function addToCave(req, res) {
       [parseInt(req.user.id) * 1000000 + parseInt(cigar_id)]);
 
     const existing = await client.query(
-      `SELECT id FROM user_cave
-       WHERE user_id=$1 AND cigar_id=$2
-       ORDER BY added_at DESC LIMIT 1`,
+      `SELECT id FROM user_cave WHERE user_id=$1 AND cigar_id=$2 ORDER BY added_at DESC LIMIT 1`,
       [req.user.id, cigar_id]);
 
     if (existing.rows.length) {
       await client.query(
-        `UPDATE user_cave SET quantity = quantity + $1,
-           price_paid = COALESCE($2, price_paid)
-         WHERE id = $3`,
-        [quantity, price_paid||null, existing.rows[0].id]);
+        'UPDATE user_cave SET quantity = quantity + $1 WHERE id = $2',
+        [quantity, existing.rows[0].id]);
     } else {
       await client.query(
-        `INSERT INTO user_cave (user_id, cigar_id, quantity, price_paid)
-         VALUES ($1,$2,$3,$4)`,
-        [req.user.id, cigar_id, quantity, price_paid||null]);
+        'INSERT INTO user_cave (user_id, cigar_id, quantity) VALUES ($1,$2,$3)',
+        [req.user.id, cigar_id, quantity]);
     }
     await client.query('COMMIT');
     res.json({ success: true });
@@ -146,25 +161,41 @@ async function removeFromCave(req, res) {
   }
 }
 
+// FIX v2.0.3b CRITIQUE : la contrainte CHECK (quantity > 0) empêchait le
+// UPDATE SET quantity - 1 quand la quantité était de 1 (résultat = 0 → erreur).
+// Correction : on lit d'abord la quantité, puis on DELETE si qty=1 ou UPDATE sinon.
 async function decrementCave(req, res) {
   const client = await db.connect();
   try {
     await client.query('BEGIN');
+
+    // Étape 1 : lire l'entrée courante
     const { rows } = await client.query(
-      `UPDATE user_cave SET quantity = quantity - 1
-       WHERE id = (
-         SELECT id FROM user_cave WHERE user_id=$1 AND cigar_id=$2
-         ORDER BY added_at DESC LIMIT 1
-       ) RETURNING id, quantity`,
+      `SELECT id, quantity FROM user_cave
+       WHERE user_id=$1 AND cigar_id=$2
+       ORDER BY added_at DESC LIMIT 1`,
       [req.user.id, req.params.cigar_id]);
+
     if (!rows.length) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Non trouvé en cave' });
+      return res.status(404).json({ error: 'Cigare non trouvé en cave' });
     }
-    const { id, quantity: qty } = rows[0];
-    if (qty <= 0) await client.query('DELETE FROM user_cave WHERE id=$1', [id]);
-    await client.query('COMMIT');
-    res.json({ quantity: Math.max(0, qty), removed: qty <= 0 });
+
+    const { id, quantity } = rows[0];
+
+    if (quantity <= 1) {
+      // Étape 2a : supprimer l'entrée si quantité = 1
+      await client.query('DELETE FROM user_cave WHERE id=$1', [id]);
+      await client.query('COMMIT');
+      return res.json({ quantity: 0, removed: true });
+    } else {
+      // Étape 2b : décrémenter (quantity > 1 donc pas de violation de contrainte)
+      const { rows: updated } = await client.query(
+        'UPDATE user_cave SET quantity = quantity - 1 WHERE id=$1 RETURNING quantity',
+        [id]);
+      await client.query('COMMIT');
+      return res.json({ quantity: updated[0].quantity, removed: false });
+    }
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('decrementCave:', e.message);
@@ -177,8 +208,6 @@ async function updateCaveItem(req, res) {
   const userId  = req.user.id;
   const qty     = req.body.quantity !== undefined ? Number(req.body.quantity) : undefined;
   const addedAt = req.body.added_at;
-
-  console.log('[updateCaveItem] entryId:', entryId, 'qty:', qty, 'addedAt:', addedAt);
 
   if (qty !== undefined && qty <= 0) {
     await db.query('DELETE FROM user_cave WHERE id=$1 AND user_id=$2', [entryId, userId]);
@@ -209,9 +238,6 @@ async function updateCaveItem(req, res) {
   }
 }
 
-// FIX v2.0.1 : scan_image_url en priorité 1 dans le COALESCE
-// Avant : COALESCE(c.admin_image_url, c.image_url) → affichait la photo de la fiche
-// Après : COALESCE(us.scan_image_url, c.admin_image_url, c.image_url) → photo de dégustation en premier
 async function getCarnet(req, res) {
   const { sort = 'date' } = req.query;
   const order = {
@@ -254,7 +280,6 @@ async function deleteScan(req, res) {
   } catch (e) { res.status(500).json({ error: 'Erreur suppression scan' }); }
 }
 
-// ── Favoris ───────────────────────────────────────────────────────────────────
 async function getFavorites(req, res) {
   try {
     const { rows } = await db.query(`
@@ -280,7 +305,6 @@ async function getFavorites(req, res) {
   } catch (e) { res.status(500).json({ error: 'Erreur favoris' }); }
 }
 
-// ── Wishlist ──────────────────────────────────────────────────────────────────
 async function getWishlist(req, res) {
   try {
     const { rows } = await db.query(`
@@ -315,7 +339,6 @@ async function removeFromWishlist(req, res) {
   } catch (e) { res.status(500).json({ error: 'Erreur suppression wishlist' }); }
 }
 
-// ── Statistiques détaillées ───────────────────────────────────────────────────
 async function getStats(req, res) {
   const userId = req.user.id;
   try {
@@ -334,22 +357,19 @@ async function getStats(req, res) {
         JOIN cigars c ON us.cigar_id = c.id
         LEFT JOIN countries co ON COALESCE(c.admin_country_id, c.country_id) = co.id
         WHERE us.user_id = $1 AND co.name IS NOT NULL
-        GROUP BY co.name
-        ORDER BY 2 DESC
+        GROUP BY co.name ORDER BY 2 DESC
       `, [userId]),
       db.query(`
         SELECT TO_CHAR(created_at, 'YYYY-MM') as month, COUNT(*)::int as count
         FROM user_scans
-        WHERE user_id = $1
-          AND created_at > NOW() - INTERVAL '12 months'
+        WHERE user_id = $1 AND created_at > NOW() - INTERVAL '12 months'
         GROUP BY 1 ORDER BY 1
       `, [userId]),
       db.query(`
         SELECT COALESCE(c.admin_strength, c.strength)::int as strength, COUNT(*)::int as count
         FROM user_scans us
         JOIN cigars c ON us.cigar_id = c.id
-        WHERE us.user_id = $1
-          AND COALESCE(c.admin_strength, c.strength) IS NOT NULL
+        WHERE us.user_id = $1 AND COALESCE(c.admin_strength, c.strength) IS NOT NULL
         GROUP BY 1 ORDER BY 1
       `, [userId]),
       db.query(`
@@ -357,17 +377,15 @@ async function getStats(req, res) {
         FROM scan_moments sm
         JOIN user_scans us ON sm.scan_id = us.id
         WHERE us.user_id = $1
-        GROUP BY sm.moment
-        ORDER BY 2 DESC LIMIT 5
+        GROUP BY sm.moment ORDER BY 2 DESC LIMIT 5
       `, [userId]),
     ]);
-
     res.json({
-      top_flavors:    flavorsRes.rows,
-      countries:      countriesRes.rows,
-      monthly:        monthlyRes.rows,
-      strength_dist:  strengthRes.rows,
-      top_moments:    momentsRes.rows,
+      top_flavors:   flavorsRes.rows,
+      countries:     countriesRes.rows,
+      monthly:       monthlyRes.rows,
+      strength_dist: strengthRes.rows,
+      top_moments:   momentsRes.rows,
     });
   } catch (e) {
     console.error('getStats:', e);
@@ -376,7 +394,7 @@ async function getStats(req, res) {
 }
 
 module.exports = {
-  getProfile, updateAvatar,
+  getProfile, updateAvatar, updateProfile,
   getCave, addToCave, removeFromCave, decrementCave, updateCaveItem,
   getCarnet, deleteScan,
   getFavorites,

@@ -42,6 +42,7 @@ async function getPublicProfile(req, res) {
         [viewerId, user.id]);
       is_following = !!f.rows.length;
     }
+    // FIX v2.0.5 : filtre is_public au lieu de public_review IS NOT NULL
     const { rows: scans } = await db.query(`
       SELECT us.id, us.rating, us.created_at, us.public_review,
         us.scan_image_url,
@@ -52,7 +53,8 @@ async function getPublicProfile(req, res) {
       JOIN cigars c ON us.cigar_id = c.id
       JOIN brands b ON c.brand_id = b.id
       LEFT JOIN scan_flavors sf ON sf.scan_id = us.id
-      WHERE us.user_id=$1 AND us.public_review IS NOT NULL
+      WHERE us.user_id=$1
+        AND (us.is_public = TRUE OR us.public_review IS NOT NULL)
       GROUP BY us.id, c.id, b.name
       ORDER BY us.created_at DESC LIMIT 20
     `, [user.id]);
@@ -79,7 +81,6 @@ async function toggleFollow(req, res) {
     } else {
       await db.query('INSERT INTO user_follows (follower_id, following_id) VALUES ($1,$2)',
         [followerId, user_id]);
-      // Notification au membre suivi
       const actor = await db.query('SELECT username FROM users WHERE id=$1', [followerId]);
       await sendToUser(db, parseInt(user_id),
         '👤 Nouvel abonné',
@@ -115,6 +116,7 @@ async function getFeed(req, res) {
       WHERE us.user_id IN (
         SELECT following_id FROM user_follows WHERE follower_id=$1
       )
+      AND (us.is_public = TRUE OR us.public_review IS NOT NULL)
       GROUP BY us.id, u.id, c.id, b.name, co.name
       ORDER BY us.created_at DESC LIMIT 50
     `, [userId]);
@@ -199,12 +201,10 @@ async function createGroup(req, res) {
        latitude||null, longitude||null, radius_km||50]);
     const groupId = rows[0].id;
 
-    // Ajouter le créateur comme admin
     await client.query(
       'INSERT INTO cigar_group_members (group_id, user_id, role) VALUES ($1,$2,$3)',
       [groupId, userId, 'admin']);
 
-    // Ajouter les membres invités (abonnés)
     for (const memberId of (member_ids || [])) {
       if (memberId !== userId) {
         await client.query(
@@ -246,22 +246,116 @@ async function joinGroup(req, res) {
   } catch (e) { res.status(500).json({ error: 'Erreur rejoindre groupe' }); }
 }
 
+// FIX v2.0.4 : protection dernier admin
 async function leaveGroup(req, res) {
   const { group_id } = req.params;
   const userId = req.user.id;
   try {
+    const member = await db.query(
+      'SELECT role FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
+      [group_id, userId]);
+    if (!member.rows.length)
+      return res.status(404).json({ error: "Vous n'êtes pas membre de ce groupe" });
+
+    if (member.rows[0].role === 'admin') {
+      const { rows: admins } = await db.query(
+        "SELECT id FROM cigar_group_members WHERE group_id=$1 AND role='admin'",
+        [group_id]);
+      if (admins.length <= 1) {
+        const { rows: others } = await db.query(
+          'SELECT id FROM cigar_group_members WHERE group_id=$1 AND user_id!=$2',
+          [group_id, userId]);
+        if (others.length > 0) {
+          return res.status(400).json({
+            error: 'Vous êtes le seul admin. Transférez le rôle admin à un autre membre avant de quitter, ou supprimez le groupe.',
+          });
+        }
+        await db.query('DELETE FROM cigar_groups WHERE id=$1', [group_id]);
+        return res.json({ success: true, group_deleted: true });
+      }
+    }
+
     await db.query(
       'DELETE FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
       [group_id, userId]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: 'Erreur quitter groupe' }); }
+  } catch (e) {
+    console.error('leaveGroup:', e);
+    res.status(500).json({ error: 'Erreur quitter groupe' });
+  }
+}
+
+// FIX v2.0.4 : inviter un membre (admin uniquement)
+async function inviteMember(req, res) {
+  const { group_id } = req.params;
+  const { user_id }  = req.body;
+  const requesterId  = req.user.id;
+  if (!user_id) return res.status(400).json({ error: 'user_id requis' });
+  try {
+    const requester = await db.query(
+      "SELECT role FROM cigar_group_members WHERE group_id=$1 AND user_id=$2",
+      [group_id, requesterId]);
+    if (!requester.rows.length || requester.rows[0].role !== 'admin')
+      return res.status(403).json({ error: 'Réservé aux admins du groupe' });
+
+    const target = await db.query('SELECT id, username FROM users WHERE id=$1', [user_id]);
+    if (!target.rows.length) return res.status(404).json({ error: 'Utilisateur introuvable' });
+
+    const result = await db.query(
+      `INSERT INTO cigar_group_members (group_id, user_id, role)
+       VALUES ($1, $2, 'member')
+       ON CONFLICT (group_id, user_id) DO NOTHING RETURNING id`,
+      [group_id, user_id]);
+    if (result.rowCount === 0)
+      return res.status(409).json({ error: 'Cet utilisateur est déjà membre du groupe' });
+
+    const group = await db.query('SELECT name FROM cigar_groups WHERE id=$1', [group_id]);
+    await sendToUser(db, user_id, '👥 Invitation à un club',
+      `${req.user.username} vous a invité à rejoindre "${group.rows[0]?.name}"`);
+    res.status(201).json({ success: true, message: `${target.rows[0].username} a été ajouté au groupe` });
+  } catch (e) {
+    console.error('inviteMember:', e);
+    res.status(500).json({ error: "Erreur lors de l'invitation" });
+  }
+}
+
+// FIX v2.0.4 : expulser un membre
+async function removeMember(req, res) {
+  const { group_id, user_id } = req.params;
+  const requesterId = req.user.id;
+  try {
+    const requester = await db.query(
+      "SELECT role FROM cigar_group_members WHERE group_id=$1 AND user_id=$2",
+      [group_id, requesterId]);
+    if (!requester.rows.length || requester.rows[0].role === 'member')
+      return res.status(403).json({ error: 'Réservé aux admins et modérateurs' });
+
+    const target = await db.query(
+      'SELECT role FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
+      [group_id, user_id]);
+    if (!target.rows.length)
+      return res.status(404).json({ error: 'Membre introuvable' });
+
+    if (requester.rows[0].role === 'moderator' && target.rows[0].role === 'admin')
+      return res.status(403).json({ error: 'Un modérateur ne peut pas expulser un admin' });
+
+    if (parseInt(user_id) === requesterId)
+      return res.status(400).json({ error: 'Utilisez "Quitter le groupe" pour vous retirer' });
+
+    await db.query(
+      'DELETE FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
+      [group_id, user_id]);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('removeMember:', e);
+    res.status(500).json({ error: 'Erreur expulsion' });
+  }
 }
 
 async function getNearbyGroups(req, res) {
   const { lat, lng, radius = 100 } = req.query;
   if (!lat || !lng) return res.status(400).json({ error: 'lat et lng requis' });
   try {
-    // Calcul distance approximatif (Haversine simplifié)
     const { rows } = await db.query(`
       SELECT g.*, u.username as creator_name,
         COUNT(gm.id) as member_count,
@@ -275,18 +369,14 @@ async function getNearbyGroups(req, res) {
       FROM cigar_groups g
       JOIN users u ON g.created_by = u.id
       LEFT JOIN cigar_group_members gm ON gm.group_id = g.id
-      WHERE g.is_geo = TRUE
-        AND g.latitude IS NOT NULL AND g.longitude IS NOT NULL
+      WHERE g.is_geo = TRUE AND g.latitude IS NOT NULL AND g.longitude IS NOT NULL
       GROUP BY g.id, u.username
-      HAVING (
-        6371 * acos(
-          cos(radians($1)) * cos(radians(g.latitude)) *
-          cos(radians(g.longitude) - radians($2)) +
-          sin(radians($1)) * sin(radians(g.latitude))
-        )
-      ) <= $3
-      ORDER BY distance_km ASC
-      LIMIT 20
+      HAVING (6371 * acos(
+        cos(radians($1)) * cos(radians(g.latitude)) *
+        cos(radians(g.longitude) - radians($2)) +
+        sin(radians($1)) * sin(radians(g.latitude))
+      )) <= $3
+      ORDER BY distance_km ASC LIMIT 20
     `, [parseFloat(lat), parseFloat(lng), parseFloat(radius)]);
     res.json(rows);
   } catch (e) {
@@ -309,13 +399,11 @@ async function getMyFollowees(req, res) {
   } catch (e) { res.status(500).json({ error: 'Erreur abonnements' }); }
 }
 
-
 // ── Posts de groupe ───────────────────────────────────────────────────────────
 async function getGroupPosts(req, res) {
   const { group_id } = req.params;
   const userId = req.user.id;
   try {
-    // Vérifier que l'utilisateur est membre
     const member = await db.query(
       'SELECT id FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
       [group_id, userId]);
@@ -323,8 +411,7 @@ async function getGroupPosts(req, res) {
 
     const { rows } = await db.query(`
       SELECT gp.id, gp.content, gp.image_url, gp.created_at,
-        u.username, u.avatar_url,
-        -- Évaluation partagée
+        u.username, u.avatar_url, u.id as user_id,
         us.id as scan_id, us.rating, us.public_review,
         c.id as cigar_id, b.name as brand, c.name as model,
         COALESCE(us.scan_image_url, c.admin_image_url, c.image_url) as cigar_image
@@ -334,8 +421,7 @@ async function getGroupPosts(req, res) {
       LEFT JOIN cigars c ON us.cigar_id = c.id
       LEFT JOIN brands b ON c.brand_id = b.id
       WHERE gp.group_id = $1
-      ORDER BY gp.created_at DESC
-      LIMIT 50
+      ORDER BY gp.created_at DESC LIMIT 50
     `, [group_id]);
     res.json(rows);
   } catch (e) {
@@ -349,19 +435,15 @@ async function createGroupPost(req, res) {
   const { content, scan_id } = req.body;
   const userId = req.user.id;
   const imageUrl = req.file?.path || null;
-
   if (!content && !imageUrl && !scan_id)
     return res.status(400).json({ error: 'Contenu, image ou évaluation requis' });
-
   try {
     const member = await db.query(
       'SELECT id FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
       [group_id, userId]);
     if (!member.rows.length) return res.status(403).json({ error: 'Non membre du groupe' });
-
     const { rows } = await db.query(
-      `INSERT INTO group_posts (group_id, user_id, content, image_url, scan_id)
-       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+      'INSERT INTO group_posts (group_id, user_id, content, image_url, scan_id) VALUES ($1,$2,$3,$4,$5) RETURNING id',
       [group_id, userId, content||null, imageUrl, scan_id||null]);
     res.status(201).json({ post_id: rows[0].id });
   } catch (e) {
@@ -379,15 +461,12 @@ async function getGroupMessages(req, res) {
       'SELECT id FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
       [group_id, userId]);
     if (!member.rows.length) return res.status(403).json({ error: 'Non membre' });
-
     const { rows } = await db.query(`
-      SELECT gm.id, gm.content, gm.created_at,
-        u.username, u.avatar_url
+      SELECT gm.id, gm.content, gm.created_at, u.id as user_id, u.username, u.avatar_url
       FROM group_messages gm
       JOIN users u ON gm.user_id = u.id
       WHERE gm.group_id = $1
-      ORDER BY gm.created_at ASC
-      LIMIT 100
+      ORDER BY gm.created_at ASC LIMIT 100
     `, [group_id]);
     res.json(rows);
   } catch (e) { res.status(500).json({ error: 'Erreur messages' }); }
@@ -398,13 +477,11 @@ async function sendGroupMessage(req, res) {
   const { content } = req.body;
   const userId = req.user.id;
   if (!content?.trim()) return res.status(400).json({ error: 'Message vide' });
-
   try {
     const member = await db.query(
       'SELECT id FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
       [group_id, userId]);
     if (!member.rows.length) return res.status(403).json({ error: 'Non membre' });
-
     const { rows } = await db.query(
       'INSERT INTO group_messages (group_id, user_id, content) VALUES ($1,$2,$3) RETURNING id',
       [group_id, userId, content.trim()]);
@@ -421,7 +498,6 @@ async function getGroupScans(req, res) {
       'SELECT id FROM cigar_group_members WHERE group_id=$1 AND user_id=$2',
       [group_id, userId]);
     if (!member.rows.length) return res.status(403).json({ error: 'Non membre' });
-
     const { rows } = await db.query(`
       SELECT DISTINCT ON (us.id)
         us.id, us.rating, us.public_review, us.created_at,
@@ -439,8 +515,7 @@ async function getGroupScans(req, res) {
       JOIN cigars c ON us.cigar_id = c.id
       JOIN brands b ON c.brand_id = b.id
       WHERE gm.group_id = $1
-      ORDER BY us.id, us.created_at DESC
-      LIMIT 50
+      ORDER BY us.id, us.created_at DESC LIMIT 50
     `, [group_id]);
     res.json(rows);
   } catch (e) {
@@ -449,29 +524,25 @@ async function getGroupScans(req, res) {
   }
 }
 
-// ── Gestion des rôles (admin/créateur uniquement) ─────────────────────────────
+// ── Gestion des rôles ────────────────────────────────────────────────────────
 async function updateMemberRole(req, res) {
   const { group_id, user_id } = req.params;
   const { role } = req.body;
   const requesterId = req.user.id;
   const VALID_ROLES = ['admin', 'moderator', 'member'];
   if (!VALID_ROLES.includes(role)) return res.status(400).json({ error: 'Rôle invalide' });
-
   try {
-    // Vérifier que le demandeur est admin du groupe
     const requester = await db.query(
       "SELECT role FROM cigar_group_members WHERE group_id=$1 AND user_id=$2",
       [group_id, requesterId]);
     if (!requester.rows.length || requester.rows[0].role !== 'admin')
       return res.status(403).json({ error: 'Réservé aux admins du groupe' });
-
     await db.query(
       'UPDATE cigar_group_members SET role=$1 WHERE group_id=$2 AND user_id=$3',
       [role, group_id, user_id]);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Erreur mise à jour rôle' }); }
 }
-
 
 async function togglePostLike(req, res) {
   const { post_id } = req.params;
@@ -498,13 +569,10 @@ async function togglePostLike(req, res) {
   } catch (e) { res.status(500).json({ error: 'Erreur like post' }); }
 }
 
-
-// ── Supprimer un post (admin du club) ────────────────────────────────────────
 async function deleteGroupPost(req, res) {
   const { group_id, post_id } = req.params;
   const userId = req.user.id;
   try {
-    // Vérifier admin du club OU auteur du post
     const member = await db.query(
       "SELECT role FROM cigar_group_members WHERE group_id=$1 AND user_id=$2",
       [group_id, userId]);
@@ -518,7 +586,6 @@ async function deleteGroupPost(req, res) {
   } catch (e) { res.status(500).json({ error: 'Erreur suppression post' }); }
 }
 
-// ── Supprimer un club (admin uniquement) ─────────────────────────────────────
 async function deleteGroup(req, res) {
   const { group_id } = req.params;
   const userId = req.user.id;
@@ -532,45 +599,73 @@ async function deleteGroup(req, res) {
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Erreur suppression club' }); }
 }
-async function inviteMember(req, res) {
-  const { group_id } = req.params;
-  const { user_id }  = req.body;
-  const requesterId  = req.user.id;
 
-  if (!user_id) return res.status(400).json({ error: 'user_id requis' });
-
+// FIX v2.0.4 : signalement utilisateur
+async function reportUser(req, res) {
+  const { user_id } = req.params;
+  const { reason, detail } = req.body;
+  const reporterId = req.user.id;
+  const VALID_REASONS = ['spam', 'inappropriate', 'harassment', 'fake', 'other'];
+  if (!reason || !VALID_REASONS.includes(reason))
+    return res.status(400).json({ error: 'Motif invalide' });
+  if (parseInt(user_id) === reporterId)
+    return res.status(400).json({ error: 'Vous ne pouvez pas vous signaler vous-même' });
   try {
-    // Vérifier que le demandeur est admin du groupe
-    const requester = await db.query(
-      "SELECT role FROM cigar_group_members WHERE group_id=$1 AND user_id=$2",
-      [group_id, requesterId]);
-    if (!requester.rows.length || requester.rows[0].role !== 'admin')
-      return res.status(403).json({ error: 'Réservé aux admins du groupe' });
-
-    // Vérifier que l'utilisateur invité existe
     const target = await db.query('SELECT id, username FROM users WHERE id=$1', [user_id]);
     if (!target.rows.length) return res.status(404).json({ error: 'Utilisateur introuvable' });
-
-    // Ajouter le membre (ON CONFLICT DO NOTHING si déjà membre)
-    const result = await db.query(
-      `INSERT INTO cigar_group_members (group_id, user_id, role)
-       VALUES ($1, $2, 'member')
-       ON CONFLICT (group_id, user_id) DO NOTHING
-       RETURNING id`,
-      [group_id, user_id]);
-
-    if (result.rowCount === 0) {
-      return res.status(409).json({ error: 'Cet utilisateur est déjà membre du groupe' });
-    }
-
-    res.status(201).json({
-      success: true,
-      message: `${target.rows[0].username} a été ajouté au groupe`,
-    });
+    const existing = await db.query(
+      "SELECT id FROM user_reports WHERE reported_user_id=$1 AND reporter_id=$2 AND status='pending'",
+      [user_id, reporterId]);
+    if (existing.rows.length)
+      return res.status(409).json({ error: 'Vous avez déjà signalé cet utilisateur' });
+    await db.query(
+      'INSERT INTO user_reports (reported_user_id, reporter_id, reason, detail) VALUES ($1,$2,$3,$4)',
+      [user_id, reporterId, reason, detail || null]);
+    res.json({ success: true });
   } catch (e) {
-    console.error('inviteMember:', e);
-    res.status(500).json({ error: "Erreur lors de l'invitation" });
+    console.error('reportUser:', e);
+    res.status(500).json({ error: 'Erreur signalement' });
   }
+}
+
+async function sanctionUser(req, res) {
+  const { user_id } = req.params;
+  const { type, reason, duration_days } = req.body;
+  const VALID_TYPES = ['warning', 'suspension', 'ban', 'reputation_reset'];
+  if (!VALID_TYPES.includes(type)) return res.status(400).json({ error: 'Type invalide' });
+  try {
+    const expires_at = (type === 'suspension' && duration_days)
+      ? new Date(Date.now() + duration_days * 86400000) : null;
+    await db.query(
+      'INSERT INTO user_sanctions (user_id, type, reason, expires_at, applied_by) VALUES ($1,$2,$3,$4,$5)',
+      [user_id, type, reason || null, expires_at, req.user.id]);
+    if (type === 'reputation_reset')
+      await db.query('UPDATE users SET reputation_score=0.01 WHERE id=$1', [user_id]);
+    await db.query(
+      "UPDATE user_reports SET status='resolved', resolved_by=$1 WHERE reported_user_id=$2 AND status='pending'",
+      [req.user.id, user_id]);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('sanctionUser:', e);
+    res.status(500).json({ error: 'Erreur sanction' });
+  }
+}
+
+async function getUserReports(req, res) {
+  const { status = 'pending' } = req.query;
+  try {
+    const { rows } = await db.query(`
+      SELECT ur.*,
+        u1.username AS reported_username, u1.avatar_url AS reported_avatar,
+        u2.username AS reporter_username
+      FROM user_reports ur
+      JOIN users u1 ON ur.reported_user_id = u1.id
+      JOIN users u2 ON ur.reporter_id = u2.id
+      WHERE ur.status = $1
+      ORDER BY ur.created_at DESC
+    `, [status]);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: 'Erreur signalements' }); }
 }
 
 module.exports = {
@@ -582,5 +677,6 @@ module.exports = {
   getGroupMessages, sendGroupMessage,
   getGroupScans, updateMemberRole,
   togglePostLike, deleteGroup,
-  inviteMember,
+  inviteMember, removeMember,
+  reportUser, sanctionUser, getUserReports,
 };
